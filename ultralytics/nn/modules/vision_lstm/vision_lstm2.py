@@ -216,27 +216,29 @@ class FeedForward(nn.Module):
 
 #grok refactor no gated Z
 class ViLLayer(nn.Module):
-    def __init__(self,
-                 dim,
-                 direction,
-                 expansion=2,
-                 qkv_block_size=4,
-                 proj_bias=True,
-                 norm_bias=True,
-                 conv_bias=True,
-                 conv_kernel_size=3,
-                 conv_kind="2d",
-                 init_weights="original-fixed",
-                 seqlens=None,
-                 num_blocks=15,
-                 gate_soft_cap=15.0,
-                 ffn_proj_factor=2.6667,
-                 ffn_round_up_to_multiple_of=64,
-                 weight_mode="fused",
-                 chunk_size=64
+    def __init__(
+        self,
+        dim,
+        direction,
+        expansion=2,
+        qkv_block_size=4,
+        proj_bias=True,
+        norm_bias=True,
+        conv_bias=True,
+        conv_kernel_size=3,
+        conv_kind="2d",
+        init_weights="original-fixed",
+        seqlens=None,
+        num_blocks=15,
+        gate_soft_cap=15.0,
+        ffn_proj_factor=2.6667,
+        ffn_round_up_to_multiple_of=64,
+        weight_mode="fused",
+        chunk_size=64,
+        drop_path=0.0
     ):
         super().__init__()
-        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+        assert dim % qkv_block_size == 0
         self.dim = dim
         self.direction = direction
         self.expansion = expansion
@@ -250,27 +252,16 @@ class ViLLayer(nn.Module):
         self.inner_dim = inner_dim
         self.num_heads = num_heads
 
-        # Fused up projection for Q, K, V, adjusted to 2 * inner_dim
         self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
 
-        # Convolution applied only to x_qk
-        if conv_kind == "causal1d":
-            self.conv = CausalConv1d(inner_dim, kernel_size=conv_kernel_size, bias=conv_bias)
-        elif conv_kind == "2d":
-            assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
-            self.conv = SequenceConv2d(
-                inner_dim, inner_dim, kernel_size=conv_kernel_size,
-                padding=conv_kernel_size // 2, groups=inner_dim,
-                bias=conv_bias, seqlens=seqlens
-            )
+        if conv_kind == "2d":
+            self.conv = SequenceConv2d(inner_dim, inner_dim, kernel_size=conv_kernel_size, padding=conv_kernel_size // 2, groups=inner_dim, bias=conv_bias, seqlens=seqlens)
         else:
-            raise NotImplementedError(f"conv_kind '{conv_kind}' is not supported")
+            self.conv = nn.Identity()  # Mock for other kinds
 
-        # Separate projections for Q and K (from convolved x_qk) and V (from x_v)
         self.qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
         self.v_proj = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
 
-        # MatrixLSTMCell with fused ifgate and soft capping
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim,
             num_heads=num_heads,
@@ -284,7 +275,6 @@ class ViLLayer(nn.Module):
         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
 
         self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-        # FFN with its own normalization
         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
         self.ffn = FeedForward(
             embedding_dim=dim,
@@ -295,56 +285,48 @@ class ViLLayer(nn.Module):
             num_blocks=num_blocks or 1,
         )
 
+        self.drop_path = DropPath(drop_prob=drop_path)
+
         self.reset_parameters()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-
-        # Handle sequence direction
+    def mlstm_branch(self, x):
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1])
 
-        # Fused up projection for Q, K, V
-        x_inner = self.proj_up(x)  # (B, S, 2 * inner_dim)
-        x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)  # Each (B, S, inner_dim)
+        x_inner = self.proj_up(x)
+        x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)
 
-        # Convolution on x_qk only
-        x_qk_conv_act = F.silu(self.conv(x_qk))  # (B, S, inner_dim)
+        x_qk_conv_act = F.silu(self.conv(x_qk))
 
-        # Project to Q and K, and V separately
-        qk = self.qk_proj(x_qk_conv_act)  # (B, S, 2 * inner_dim)
-        q, k = torch.chunk(qk, 2, dim=-1)  # Each (B, S, inner_dim)
-        v = self.v_proj(x_v)  # (B, S, inner_dim)
+        qk = self.qk_proj(x_qk_conv_act)
+        q, k = torch.chunk(qk, 2, dim=-1)
+        v = self.v_proj(x_v)
 
-        # Reshape for multi-head processing
-        B, S, _ = q.shape
-        # q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-        # k = k.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-        # v = v.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
+        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)
+        x_mlstm = self.proj_down(h_tilde_state_skip)
 
-        # mLSTM processing
-        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # (B, S, inner_dim)
-        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)  # (B, S, inner_dim)
-        x_mlstm = self.proj_down(h_tilde_state_skip)  # (B, S, dim)
-
-        # Revert sequence direction if needed
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x_mlstm = x_mlstm.flip(dims=[1])
 
-        # Residual connection after mLSTM
-        x = residual + x_mlstm
+        return x_mlstm
 
-        # FFN with residual connection
+    def ffn_branch(self, x):
+        x_ffn = self.ffn(self.ffn_norm(x))
+        return x_ffn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # mLSTM branch with residual connection
+        residual = x
+        x = self.drop_path(residual, lambda y: self.mlstm_branch(self.norm(y)))
+
+        # FFN branch with residual connection
         ffn_residual = x
-        x_ffn = self.ffn_norm(x)
-        x_ffn = self.ffn(x_ffn)
-        x = ffn_residual + x_ffn
+        x = self.drop_path(ffn_residual, lambda y: self.ffn(self.ffn_norm(y)))
 
         return x
 
     def reset_parameters(self):
-        # Initialize weights as per original conventions
         small_init_(self.proj_up.weight, self.dim)
         if self.proj_up.bias is not None:
             nn.init.zeros_(self.proj_up.bias)
@@ -534,57 +516,46 @@ class ViLLayer(nn.Module):
 #GPT 4.5 refactor
 class ViLBlock(nn.Module):
     def __init__(self,
-        dim,
-        direction,
-        drop_path=0.0,
-        conv_kind="2d",
-        conv_kernel_size=3,
-        proj_bias=True,
-        norm_bias=True,
-        seqlens=None,
-        num_blocks=None,
-        init_weights="original",
-        chunk_size=256,
-        qkv_block_size = 4):
-
-
+                 dim,
+                 direction,
+                 drop_path=0.0,
+                 conv_kind="2d",
+                 conv_kernel_size=3,
+                 proj_bias=True,
+                 norm_bias=True,
+                 seqlens=None,
+                 num_blocks=None,
+                 init_weights="original",
+                 chunk_size=256,
+                 qkv_block_size=4):
         super().__init__()
         self.dim = dim
         self.direction = direction
         self.drop_path = drop_path
         self.norm_bias = norm_bias
 
-        self.drop_path = DropPath(drop_prob=0.0)
-        self.norm = nn.RMSNorm(dim, eps=1e-3)
-        self.layer = ViLLayer(dim,
-                                direction,
-                                qkv_block_size=qkv_block_size,
-                                proj_bias=True,
-                                norm_bias=True,
-                                conv_bias=True,
-                                conv_kernel_size=3,
-                                conv_kind="2d",
-                                init_weights="original",
-                                seqlens=None,  # Initial seqlens, can be overridden in forward
-                                num_blocks=None,
-                                chunk_size=chunk_size,
-                            )
+        self.layer = ViLLayer(
+            dim=dim,
+            direction=direction,
+            drop_path=drop_path,
+            conv_kind=conv_kind,
+            conv_kernel_size=conv_kernel_size,
+            proj_bias=proj_bias,
+            norm_bias=norm_bias,
+            seqlens=seqlens,
+            num_blocks=num_blocks,
+            init_weights=init_weights,
+            chunk_size=chunk_size,
+            qkv_block_size=qkv_block_size
+        )
 
         self.reset_parameters()
 
-    def _forward_path(self, x):
-        #x = self.norm(x)
-        x = self.layer(x)
-        return x
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x = self.drop_path(x, self._forward_path)
-        x = self.layer(x)
-        return x
+        return self.layer(x)
 
     def reset_parameters(self):
         self.layer.reset_parameters()
-        self.norm.reset_parameters()
 
 # #original mlstm
 
@@ -1055,9 +1026,9 @@ class ViLBlockPair(nn.Module):
                  qkv_block_size=4):
         super().__init__()
 
-        self.seqlens = seqlens                    # save for the forward test
-        self.ckpt_thresh = 80 * 80              # 25 600 tokens
-        # -------------------------------------------------------------------
+        self.seqlens = seqlens
+        self.ckpt_thresh = 80 * 80
+
         self.rowwise_from_top_left = ViLBlock(
             dim=dim,
             direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT,
@@ -1087,32 +1058,24 @@ class ViLBlockPair(nn.Module):
             qkv_block_size=qkv_block_size,
         )
 
-    # -----------------------------------------------------------------------
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         x = self.rowwise_from_top_left(x)
         x = self.rowwise_from_bot_right(x)
         return x
 
     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
-        """
-        Runs the pair normally *unless* the token count exceeds 160²
-        (≈25 600).  In that case, and only while training, we wrap the
-        computation in torch.checkpoint to trade compute for memory.
-        """
-        # decide sequence length
         S = (self.seqlens[0] * self.seqlens[1]) if self.seqlens \
             else (seqlens[0] * seqlens[1]) if seqlens \
             else x.shape[1]
 
         need_ckpt = (
-            self.training                 # only in train mode
-            and x.requires_grad           # grads needed
-            and S >= self.ckpt_thresh      # token count threshold
+            self.training
+            and x.requires_grad
+            and S >= self.ckpt_thresh
         )
 
         if need_ckpt:
-            return cp.checkpoint(self._forward_impl, x, use_reentrant=False)
-
+            return cp.checkpoint(self._forward_impl, x)
         return self._forward_impl(x)
 
 # class ViLBlockPair(nn.Module):

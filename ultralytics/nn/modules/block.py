@@ -2376,33 +2376,14 @@ class ViLFusionBlock(nn.Module):
         mlp_act_layer=nn.GELU,
         mlp_drop_rate: float = 0.0,
     ):
-        """
-        Initialize the FusionViLBlock, mirroring XSSBlock logic with ViLBlockPairBlock.
-
-        Args:
-            in_channels (int): Number of input channels.
-            hidden_dim (int): Hidden dimension after projection.
-            config (dict): Configuration dict with 'seqlens', etc.
-            n (int): Number of ViLBlockPairBlock repetitions.
-            mlp_ratio (float): Expansion ratio for MLP hidden dimension.
-            drop_path (float): Drop path probability.
-            norm_layer (callable): Normalization layer constructor.
-            mlp_act_layer (type): Activation layer for MLP.
-            mlp_drop_rate (float): Dropout rate for MLP.
-        """
         super().__init__()
-
-        # print(config)
-        # Extract seqlens from config
         seqlens = config.get("seqlens")
-        mlp_ratio = config.get("mlp_ratio")
         if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
             raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
 
         self.seqlens = seqlens
         self.hidden_dim = hidden_dim
 
-        # Input projection (same as XSSBlock)
         self.in_proj = (
             nn.Sequential(
                 nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
@@ -2411,26 +2392,20 @@ class ViLFusionBlock(nn.Module):
             ) if in_channels != hidden_dim else nn.Identity()
         )
 
-        # Local spatial processing (LSBlock from XSSBlock)
         self.lsblock = LSBlock(hidden_dim, hidden_dim)
 
-        # Normalization for sequence input (B, S, D)
         self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
+        self.norm2 = nn.RMSNorm(hidden_dim, eps=1e-6, elementwise_affine=True)
 
-        # ViLBlockPairBlock replacing SS2D
         self.vil = nn.Sequential(*[
             ViLBlockPairBlock(hidden_dim, hidden_dim, config)
             for _ in range(n)
         ])
 
-        # DropPath from vision_lstm_util.py
-        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path = DropPath(drop_prob=drop_path)
 
-        # Optional MLP branch (same as XSSBlock)
         self.mlp_branch = mlp_ratio > 0
         if self.mlp_branch:
-            #print("MLP EXISTS!")
-            self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)  # Sequence norm
             mlp_hidden_dim = int(hidden_dim * mlp_ratio)
             self.mlp = RGBlock(
                 in_features=hidden_dim,
@@ -2440,51 +2415,37 @@ class ViLFusionBlock(nn.Module):
             )
 
     def forward(self, x):
-        """
-        Forward pass mirroring XSSBlock logic.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C_in, H, W).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, hidden_dim, H, W).
-        """
-        # Input projection
         x = self.in_proj(x)  # (B, hidden_dim, H, W)
 
-        # Local spatial processing
         x_local = self.lsblock(x)  # (B, hidden_dim, H, W)
 
-        # Flatten to sequence for ViLBlockPairBlock
         B, C, H, W = x_local.shape
         seq = einops.rearrange(x_local, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
 
-        # Normalize and process with ViLBlockPairBlock
-        #seq_norm = self.norm(seq)  # (B, S, hidden_dim)
-        seq_out = self.vil(seq)  # (B, S, hidden_dim)
+        seq_norm = self.norm(seq)  # (B, S, hidden_dim)
+        seq_out = self.vil(seq_norm)  # (B, S, hidden_dim)
 
-        # Apply drop path and residual connection in sequence space
-        seq = seq + self.drop_path(seq_out)  # (B, S, hidden_dim)
+        # Use lambda to provide constant residual addition
+        def const_add(_):
+            return seq_out
+        seq = self.drop_path(seq, residual_path=const_add)  # seq + drop(seq_out)
 
-        # Reshape back to 4D
         x_global = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
 
-        # Residual connection with original input
         x = x + x_global  # (B, hidden_dim, H, W)
 
-        # Optional MLP branch
         if self.mlp_branch:
-            # Flatten again for MLP (RGBlock expects 4D input)
             seq = einops.rearrange(x, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
-            # seq_norm = self.norm2(seq)  # (B, S, hidden_dim)
-            # Reshape to 4D for RGBlock
-            x_mlp = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
+            seq_norm = self.norm2(seq)  # (B, S, hidden_dim)
+            x_mlp = einops.rearrange(seq_norm, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
             x_mlp = self.mlp(x_mlp)  # (B, hidden_dim, H, W)
-            # Add back with drop path
-            x = x + self.drop_path(x_mlp)  # (B, hidden_dim, H, W)
+            # Use lambda for MLP addition
+            def const_mlp(_):
+                return x_mlp
+            x = self.drop_path(x, residual_path=const_mlp)  # x + drop(x_mlp)
 
         return x
-
+        
 # Definition of the PatchMerger class
 class PatchMerger(nn.Module):
     def __init__(self, dim, num_tokens_out):
