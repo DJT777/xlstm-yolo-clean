@@ -7,8 +7,11 @@ import types
 from copy import deepcopy
 from pathlib import Path
 import math
+from ultralytics.utils.torch_utils import de_parallel, smart_inference_mode
 
 import torch
+from torch import nn
+from ultralytics.nn.modules.block import propagate_seqlens
 
 from ultralytics.nn.modules import (
     AIFI,
@@ -80,8 +83,11 @@ from ultralytics.nn.modules import (
     PermuteBlock,
     FlattenPosEmbedBlock,
     PatchMerging,
-    ViLBlock,
-    SimpleStem
+    SimpleStem,
+    SwinPatchMergeBlock,
+    SwinPatchExpandBlock,
+    WindowedViLBlockPairBlock,
+    WindowedViLFusionBlock
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -150,6 +156,308 @@ class BaseModel(torch.nn.Module):
         if augment:
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize, embed)
+    
+    # def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    #     """
+    #     Perform a forward pass through the network.
+        
+    #     Args:
+    #         x (torch.Tensor): The input tensor to the model.
+    #         profile (bool):  Print the computation time of each layer if True, defaults to False.
+    #         visualize (bool): Save the feature maps of the model if True, defaults to False.
+    #         embed (list, optional): A list of feature vectors/embeddings to return.
+        
+    #     Returns:
+    #         (torch.Tensor): The last output of the model.
+    #     """
+    #     y = []  # outputs (for compatibility, though we use outputs list)
+    #     dt = ops.Profile() if profile else None
+    #     embeddings = [] if embed is not None else None
+
+    #     # Current image grid (start)
+    #     H, W = int(x.shape[-2]), int(x.shape[-1])
+
+    #     def _derive_hw(inp, default_hw):
+    #         """Find (H,W) from this module's actual inputs."""
+    #         h, w = default_hw
+    #         if isinstance(inp, torch.Tensor):
+    #             if inp.ndim == 4:
+    #                 return int(inp.shape[-2]), int(inp.shape[-1])
+    #             elif inp.ndim == 3:
+    #                 # For flattened sequence, try to infer if possible (e.g., assume square)
+    #                 l = inp.shape[1]
+    #                 sq = int(math.sqrt(l))
+    #                 if sq * sq == l:
+    #                     return sq, sq
+    #                 return h, w  # fallback
+    #         elif isinstance(inp, (list, tuple)):
+    #             for t in inp:
+    #                 nh, nw = _derive_hw(t, default_hw)
+    #                 if (nh, nw) != default_hw:
+    #                     return nh, nw
+    #         return h, w
+
+    #     outputs = []
+    #     last = x
+
+    #     for i, m in enumerate(self.model):
+    #         # Gather inputs (routing)
+    #         if m.f == -1:
+    #             xi = last
+    #         else:
+    #             if isinstance(m.f, int):
+    #                 xi = outputs[m.f]
+    #             else:
+    #                 xi = [last if j == -1 else outputs[j] for j in m.f]
+
+    #         # Derive input grid
+    #         Hin, Win = _derive_hw(xi, (H, W))
+
+    #         # Push input grid to module
+    #         if hasattr(m, "set_seqlens"):
+    #             propagate_seqlens(m, (Hin, Win))
+
+    #         # Execute forward
+    #         if profile:
+    #             with dt:
+    #                 xo = m(xi)
+    #             if RANK in {-1, 0}:
+    #                 LOGGER.info(f"{i:>3} {m.type:<50} {dt.dt * 1e3:.1f}ms")
+    #         else:
+    #             xo = m(xi)
+
+    #         # Update current grid for downstream
+    #         if isinstance(xo, torch.Tensor):
+    #             if xo.ndim == 4:
+    #                 H, W = int(xo.shape[-2]), int(xo.shape[-1])
+    #             elif xo.ndim == 3:
+    #                 name = m.__class__.__name__
+    #                 if name == "SwinPatchMergeBlock":
+    #                     H, W = math.ceil(Hin / 2), math.ceil(Win / 2)
+    #                 elif name == "SwinPatchExpandBlock":
+    #                     H, W = Hin * 2, Win * 2
+    #                 elif name == "VitPatchEmbedBlock":
+    #                     ps = getattr(m, "patch_size", (4, 4))  # Assume attribute exists
+    #                     H, W = Hin // ps[0], Win // ps[1]
+    #                 else:
+    #                     H, W = Hin, Win  # Unchanged for pure sequence ops
+    #             else:
+    #                 H, W = Hin, Win
+    #         else:
+    #             H, W = Hin, Win  # Non-tensor outputs (rare)
+
+    #         # Store output for routing
+    #         outputs.append(xo if m.i in self.save else None)
+    #         last = xo
+
+    #         # Visualize if requested
+    #         if visualize:
+    #             from ultralytics.utils.plotting import feature_visualization
+    #             feature_visualization(xo, m.type, m.i, save_dir=self.save_dir)
+
+    #         # Embed if requested
+    #         if embed and m.i in embed:
+    #             emb = xo.mean(dim=[-2, -1]) if xo.ndim == 4 else xo.mean(dim=1)  # Global avg pool approx
+    #             embeddings.append(emb)
+
+    #     if embeddings:
+    #         return torch.cat(embeddings, dim=1) if len(embeddings) > 1 else embeddings[0]
+
+    #     return last
+
+
+
+
+    # def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    #     """
+    #     Minimal multi-scale propagation:
+    #     • Push incoming (H, W) into wrappers via .set_seqlens((H, W)) before each module
+    #     • Update (H, W) only when scale changes, or from image tensors
+    #     Assumes wrappers implement .set_seqlens((H, W)) and don't mutate global state.
+    #     """
+
+
+    #     y = []  # outputs (for compatibility, though we use outputs list)
+    #     dt = ops.Profile() if profile else None
+    #     embeddings = [] if embed is not None else None
+
+    #     # Current image grid (start)
+    #     H, W = int(x.shape[-2]), int(x.shape[-1])
+    #     print(H)
+    #     print(W)
+
+    #     def _derive_hw(inp, default_hw):
+    #         """Find (H,W) from this module's actual inputs."""
+    #         h, w = default_hw
+    #         if isinstance(inp, torch.Tensor):
+    #             if inp.ndim == 4:
+    #                 return int(inp.shape[-2]), int(inp.shape[-1])
+    #             elif inp.ndim == 3:
+    #                 # For flattened sequence, try to infer if possible (e.g., assume square)
+    #                 l = inp.shape[1]
+    #                 sq = int(math.sqrt(l))
+    #                 if sq * sq == l:
+    #                     return sq, sq
+    #                 return h, w  # fallback
+    #         elif isinstance(inp, (list, tuple)):
+    #             for t in inp:
+    #                 nh, nw = _derive_hw(t, default_hw)
+    #                 if (nh, nw) != default_hw:
+    #                     return nh, nw
+    #         return h, w
+
+    #     outputs = []
+    #     last = x
+
+    #     for i, m in enumerate(self.model):
+    #         # Gather inputs (routing)
+    #         if m.f == -1:
+    #             xi = last
+    #         else:
+    #             if isinstance(m.f, int):
+    #                 xi = outputs[m.f]
+    #             else:
+    #                 xi = [last if j == -1 else outputs[j] for j in m.f]
+
+    #         # Derive input grid
+    #         Hin, Win = _derive_hw(xi, (H, W))
+
+    #         # Push input grid to module
+    #         if hasattr(m, "set_seqlens"):
+    #             m.set_seqlens((Hin, Win))
+
+    #         # Execute forward
+    #         if profile:
+    #             with dt:
+    #                 xo = m(xi)
+    #             if RANK in {-1, 0}:
+    #                 LOGGER.info(f"{i:>3} {m.type:<50} {dt.dt * 1e3:.1f}ms")
+    #         else:
+    #             xo = m(xi)
+
+    #         # Update current grid for downstream
+    #         if isinstance(xo, torch.Tensor):
+    #             if xo.ndim == 4:
+    #                 H, W = int(xo.shape[-2]), int(xo.shape[-1])
+    #             elif xo.ndim == 3:
+    #                 name = m.__class__.__name__
+    #                 if name == "SwinPatchMergeBlock":
+    #                     H, W = math.ceil(Hin / 2), math.ceil(Win / 2)
+    #                 elif name == "SwinPatchExpandBlock":
+    #                     H, W = Hin * 2, Win * 2
+    #                 elif name == "VitPatchEmbedBlock":
+    #                     ps = getattr(m, "patch_size", (4, 4))  # Assume attribute exists
+    #                     H, W = Hin // ps[0], Win // ps[1]
+    #                 else:
+    #                     H, W = Hin, Win  # Unchanged for pure sequence ops
+    #             else:
+    #                 H, W = Hin, Win
+    #         else:
+    #             H, W = Hin, Win  # Non-tensor outputs (rare)
+
+    #         # Store output for routing
+    #         outputs.append(xo if m.i in self.save else None)
+    #         last = xo
+
+    #         # Visualize if requested
+    #         if visualize:
+    #             from ultralytics.utils.plotting import feature_visualization
+    #             feature_visualization(xo, m.type, m.i, save_dir=self.save_dir)
+
+    #         # Embed if requested
+    #         if embed and m.i in embed:
+    #             emb = xo.mean(dim=[-2, -1]) if xo.ndim == 4 else xo.mean(dim=1)  # Global avg pool approx
+    #             embeddings.append(emb)
+
+    #     if embeddings:
+    #         return torch.cat(embeddings, dim=1) if len(embeddings) > 1 else embeddings[0]
+
+    #     return last
+
+
+                
+    # def _predict_once(self, x, profile: bool = False, visualize: bool = False, embed=None):
+    #     """
+    #     Run a forward pass for prediction/inference with per-batch (H, W) propagated
+    #     into grid-aware wrappers via .set_seqlens((H, W)) right before each module executes.
+
+    #     Assumptions:
+    #     - Your top-level wrappers (VitPatchEmbedBlock, VitPosEmbedBlock, ViLBlockPairBlock,
+    #         ViLFusionBlock, SwinPatch{Merge,Expand}Block, SequenceToImage, etc.) implement:
+    #             def set_seqlens(self, hw: tuple[int, int]) -> "Self"
+    #         and, if they change spatial scale (e.g., Patch/Merge/Expand), they store the
+    #         *output* grid in `self.seqlens` and propagate to children as needed.
+    #     - Other modules simply ignore the property (no harm).
+
+    #     Notes:
+    #     - We keep an `outputs` list for graph fan-in (m.f). This is intentionally simple
+    #         (stores all outputs) for clarity and minimal refactor.
+    #     - We update (H, W) using, in order of trust:
+    #         1) the wrapper's `self.seqlens` (if present), else
+    #         2) the tensor shape if the module returned an image-like [B, C, H, W], else
+    #         3) retain previous (H, W) for sequence-only ops.
+    #     """
+    #     import torch
+
+    #     # Current batch image grid
+    #     H, W = int(x.shape[-2]), int(x.shape[-1])
+
+    #     def _derive_hw(inp, default_hw):
+    #         """Get (H, W) from a module input if it contains any image-like tensor."""
+    #         h, w = default_hw
+    #         if isinstance(inp, torch.Tensor):
+    #             if inp.ndim == 4:
+    #                 h, w = int(inp.shape[-2]), int(inp.shape[-1])
+    #         elif isinstance(inp, (list, tuple)):
+    #             for t in inp:
+    #                 if isinstance(t, torch.Tensor) and t.ndim == 4:
+    #                     h, w = int(t.shape[-2]), int(t.shape[-1])
+    #                     break
+    #         return h, w
+
+    #     outputs = []  # outputs of all layers for routing (m.f)
+    #     x_in = x      # keep original input around for m.f == -1
+
+    #     for i, m in enumerate(self.model):
+    #         # 1) Gather inputs according to m.f (Ultralytics-style routing)
+    #         if hasattr(m, "f"):
+    #             f = m.f
+    #             if isinstance(f, int):
+    #                 xi = x_in if f == -1 else outputs[f]
+    #             else:
+    #                 xi = [x_in if j == -1 else outputs[j] for j in f]
+    #         else:
+    #             xi = x
+
+    #         # 2) Determine the grid seen by THIS module from its actual inputs
+    #         H, W = _derive_hw(xi, (H, W))
+
+    #         # 3) Push (H, W) to wrappers that expose the setter (fans out to children)
+    #         if hasattr(m, "set_seqlens"):
+    #             m.set_seqlens((H, W))
+
+    #         # 4) Execute the module
+    #         xo = m(xi)
+
+    #         # 5) Update (H, W) for the next module
+    #         #    Prefer the wrapper’s declared output grid if available
+    #         if hasattr(m, "seqlens"):
+    #             try:
+    #                 h_out, w_out = m.seqlens
+    #                 H, W = int(h_out), int(w_out)
+    #             except Exception:
+    #                 pass
+
+    #         # If the module produced an image tensor, the tensor is authoritative
+    #         if isinstance(xo, torch.Tensor) and xo.ndim == 4:
+    #             H, W = int(xo.shape[-2]), int(xo.shape[-1])
+
+    #         # 6) Book-keeping
+    #         outputs.append(xo)
+    #         x = xo  # feed-forward for modules that use -1 (previous)
+
+    #     return x
+
 
     def _predict_once(self, x, profile=True, visualize=False, embed=None):
         """
@@ -1073,9 +1381,9 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
 def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     """Parse a YOLO model.yaml dictionary into a PyTorch model."""
     import ast
+    import contextlib
 
     # Args
-    legacy = True  # Backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
     nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
@@ -1087,197 +1395,88 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         depth, width, max_channels = scales[scale]
 
     if act:
-        Conv.default_act = eval(act)  # Redefine default activation, e.g., Conv.default_act = torch.nn.SiLU()
+        Conv.default_act = eval(act)
         if verbose:
-            LOGGER.info(f"{colorstr('activation:')} {act}")  # Print activation
+            LOGGER.info(f"{colorstr('activation:')} {act}")
 
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
-    ch = [ch]  # Initialize channels list with input channels
-    layers, save, c2 = [], [], ch[-1]  # Layers, savelist, output channels
-    base_modules = frozenset(
-        {
-            Classify,
-            Conv,
-            ConvTranspose,
-            GhostConv,
-            Bottleneck,
-            GhostBottleneck,
-            SPP,
-            SPPF,
-            C2fPSA,
-            C2PSA,
-            DWConv,
-            Focus,
-            BottleneckCSP,
-            C1,
-            C2,
-            C2f,
-            C3k2,
-            RepNCSPELAN4,
-            ELAN1,
-            ADown,
-            AConv,
-            SPPELAN,
-            C2fAttn,
-            C3,
-            C3TR,
-            C3Ghost,
-            torch.nn.ConvTranspose2d,
-            DWConvTranspose2d,
-            C3x,
-            RepC3,
-            PSA,
-            SCDown,
-            C2fCIB,
-            A2C2f,
-            VisionLSTM,
-            VisionLSTMTorch,
-            #FeatureSplitIndex,
-            # Removed custom modules that don't require c1 prepending
-            # VitPatchEmbedBlock,  # Already commented out
-            # VitPosEmbed2dBlock,  # Removed to prevent args modification
-            #ViLBlockPairBlock,
-            #SequenceToImage,
-            SequenceConv2dBlock,
-        }
-    )
-    repeat_modules = frozenset(  # Modules with 'repeat' arguments
-        {
-            BottleneckCSP,
-            C1,
-            C2,
-            C2f,
-            C3k2,
-            C2fAttn,
-            C3,
-            C3TR,
-            C3Ghost,
-            C3x,
-            RepC3,
-            C2fPSA,
-            C2fCIB,
-            C2PSA,
-            A2C2f,
-        }
-    )
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        # Resolve module string to actual class
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )
+    
+    ch = [ch]  # Initialize channels list
+    layers, save, c2 = [], [], ch[-1]  # layers, savelist, output channels
+    
+    # Define module sets for different parsing logic
+    base_modules = {
+        Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv,
+        C3, C3TR, C3Ghost, C3x, RepC3, BottleneckCSP, C2f
+    }
+    repeat_modules = {C3, C3TR, C3Ghost, C3x, RepC3, BottleneckCSP, C2f}
 
-        # Evaluate string arguments
+    # New set for transformer-style blocks that take (c1, c2, ...)
+    transformer_modules = {
+        ViLBlockPairBlock, ViLFusionBlock, SwinPatchMergeBlock, SwinPatchExpandBlock, VitPosEmbedBlock
+    }
+
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+        m = globals()[m]  # Resolve module string to class
+
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # Depth gain
+        
+        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
 
         if m in base_modules:
             c1, c2 = ch[f], args[0]
-            if c2 != nc:  # Adjust c2 if not equal to number of classes
-                c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # Adjust embed channels and num heads
-                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
-                args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
+            c2 = make_divisible(min(c2, max_channels) * width, 8) if c2 != nc else c2
             args = [c1, c2, *args[1:]]
             if m in repeat_modules:
-                args.insert(2, n)  # Insert number of repeats
+                args.insert(2, n)
                 n = 1
-            if m is C3k2:  # For M/L/X sizes
-                legacy = False
-                if scale in "mlx":
-                    args[3] = True
-            if m is A2C2f:
-                legacy = False
-                if scale in "lx":  # For L/X sizes
-                    args.extend((True, 1.2))
-        elif m in {VitPatchEmbedBlock, SequenceConv2dBlock}:
-            c1 = args[0]  # Input channels from args
-            c2 = args[1]  # Output channels from args
-            # Use args as is, no prepending of c1
-        elif m is PatchMergeBlock:
+        
+        elif m in transformer_modules:
             c1 = ch[f]
-            c2 = args[3]  # out_dim from args, e.g., 512 or 1024
-        elif m is PatchMerging: # <<< MODIFIED/ADDED BLOCK
+            c2 = args[1] # Output channels are the second argument
+            args[0] = c1 # Replace placeholder input channels with actual c1
+        
+        elif m is VitPatchEmbedBlock:
+            # First layer, c1 is from YAML (e.g., 3 for RGB)
+            c1 = args[0]
+            c2 = args[1]
+        
+        elif m is PermuteBlock:
+            # Permute does not change the number of channels
             c1 = ch[f]
-            c2 = 2 * c1  # SWIN doubles the input dimension
-            args = [c1]  # PatchMerging __init__ takes c1 (as in_dim)
-        # elif m is ViLPairBlockWrapper:
-        #     c1 = ch[f]
-        #     c2 = args[0]  # dim from args, e.g., 256, 512, or 1024
-        elif m in {ViLBlockPairBlock, ViLFusionBlock, ViLBlock}:
-            c1 = ch[f]            
-            c2 = args[1]  # c2 from args3
-        elif m is VisionClueMerge:
-            c1 = ch[f]
-            c2 = args[1]  # c2 from args
-        elif m is FeatureSplitIndex:
-            c2 = ch[f]  # Output channels from previous layer
-            index = args[0]  # Explicitly use the provided index
-            m_ = m(index)
-        elif m in {SequenceToImage}:
-            c1 = ch[f]
-            c2 = ch[f]  # Channels unchanged
-            # print("SEQ CHANNELS")
-            # print(c1)
-            # print(c2)
-            # args remains unmodified, passed directly from YAML
-        elif m is AIFI:
-            args = [ch[f], *args]
-        elif m in frozenset({HGStem, HGBlock}):
-            c1, cm, c2 = ch[f], args[0], args[1]
-            args = [c1, cm, c2, *args[2:]]
-            if m is HGBlock:
-                args.insert(4, n)  # Number of repeats
-                n = 1
-        elif m is ResNetLayer:
-            c2 = args[1] if args[3] else args[1] * 4
-        elif m is torch.nn.BatchNorm2d:
-            args = [ch[f]]
+            c2 = ch[f]
+
         elif m is Concat:
+            # Concatenation sums channels from specified layers
             c2 = sum(ch[x] for x in f)
-        elif m in frozenset({Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
+
+        elif m is Detect:
+            # Detect head takes a list of input channels
             args.append([ch[x] for x in f])
-            if m is Segment:
-                args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, Segment, Pose, OBB}:
-                # print("DETECT ARGS")
-                # print(args)
-                m.legacy = legacy
-        elif m is RTDETRDecoder:  # Channels arg passed in index 1
-            args.insert(1, [ch[x] for x in f])
-        elif m is CBLinear:
-            c2 = args[0]
-            c1 = ch[f]
-            args = [c1, c2, *args[1:]]
-        elif m is CBFuse:
-            c2 = ch[f[-1]]
-        elif m in frozenset({TorchVision, Index}):
-            c2 = args[0]
-            c1 = ch[f]
-            args = [*args[1:]]
+        
         else:
+            # Default case for modules without special channel handling
             c2 = ch[f]
 
         # Create module instance
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
-        t = str(m)[8:-2].replace("__main__.", "")  # Module type
-        m_.np = sum(x.numel() for x in m_.parameters())  # Number of parameters
-        m_.i, m_.f, m_.type = i, f, t  # Attach index, 'from' index, type
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+        t = str(m)[8:-2].replace("__main__.", "")
+        m_.np = sum(x.numel() for x in m_.parameters())
+        m_.i, m_.f, m_.type = i, f, t
         if verbose:
-            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # Print layer info
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # Append to savelist
+            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")
+        
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
-        ch.append(c2)  # Update channels list
-    return torch.nn.Sequential(*layers), sorted(save)
+        ch.append(c2)
+
+    return nn.Sequential(*layers), sorted(save)
 
 
 def yaml_model_load(path):

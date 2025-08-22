@@ -1,8 +1,8 @@
-# YOLO-ViL model configuration for 640x640 input with intermediate posembed blocks removed
-ch: 3            # Number of input channels (RGB)
-nc: 80           # Number of classes for detection
-imgsz: 640       # Input image size (640x640)
-scales:          # Model compound scaling constants
+# YOLO-ViL model configuration for 640x640 input, BASE DIM = 384, linear DropPath 0→0.2
+ch: 3
+nc: 80
+imgsz: 640
+scales:
   n: [1.00, 1.00, 1024]
   s: [1.00, 1.00, 1024]
   m: [1.00, 1.00, 512]
@@ -11,64 +11,66 @@ scales:          # Model compound scaling constants
 
 # Backbone
 backbone:
-  # Stage 0: Initial Patch Embedding (8x8 patches -> 80x80 grid, 256 channels)
-  - [-1, 1, VitPatchEmbedBlock, [3, 384, [640,640], [8,8]]]      # 0: [B, 6400, 256]
-  - [-1, 1, VitPosEmbedBlock,  [384, 384, [80,80]]]              # 1: [B, 6400, 256]
+  # Stage 0: Initial Patch Embedding (8x8 patches -> 80x80 grid, 384 channels)
+  - [-1, 1, VitPatchEmbedBlock, [3, 384, [640,640], [8,8]]]      # 0: [B, 6400, 384]
+  - [-1, 1, VitPosEmbedBlock,  [384, 384, [80,80]]]              # 1: [B, 6400, 384]
 
-  # Stage 1: ViL Blocks for 80x80 grid (1 block, 256 channels) -> S1_out (for P2_img)
-  - [-1, 1, ViLBlockPairBlock,  [384, 384, {seqlens: [80,80], chunk_size: 512, conv_kind: '2d', qkv_block_size: 128}]] # 2: S1_out [B, 6400, 256]
+  # Stage 1: ViL Blocks for 80x80 grid
+  - [-1, 1, ViLBlockPairBlock, [384, 384, {seqlens: [80,80],  chunk_size: 512, conv_kind: '2d', qkv_Block_size: 64, drop_path: 0.000}]] # 2
 
-  # Stage 2: Merge to 40x40 grid (256 ch), ViL Blocks (1 block, 256 ch) -> S2_out (for P3_img)
-  - [-1, 1, PatchMerger,         [384, 1600]]                    # 3: [B, 1600, 256] (40*40=1600)
-  - [-1, 1, ViLBlockPairBlock,  [384, 384, {seqlens: [40,40], chunk_size: 512, conv_kind: '2d', qkv_block_size: 128}]] # 4: S2_out [B, 1600, 256]
+  # Stage 2: 40x40 grid
+  - [-1, 1, PatchMerger,        [384, 1600]]                     # 3: [B, 1600, 384]
+  - [-1, 1, ViLBlockPairBlock, [384, 384, {seqlens: [40,40],  chunk_size: 512, conv_kind: '2d', qkv_Block_size: 64, drop_path: 0.022}]] # 4
 
-  # Stage 3: Merge to 20x20 grid (256 ch), ViL Blocks (1 block, 256 ch) -> S3_out (for P4_img)
-  - [-1, 1, PatchMerger,         [384, 400]]                     # 5: [B, 400, 256] (20*20=400)
-  - [-1, 1, ViLBlockPairBlock,  [384, 384, {seqlens: [20,20], chunk_size: 256, conv_kind: '2d', qkv_block_size: 128}]] # 6: S3_out [B, 400, 256]
+  # Stage 3: 20x20 grid
+  - [-1, 1, PatchMerger,        [384, 400]]                      # 5: [B, 400, 384]
+  - [-1, 1, ViLBlockPairBlock, [384, 384, {seqlens: [20,20],  chunk_size: 256, conv_kind: '2d', qkv_Block_size: 64, drop_path: 0.044}]] # 6
 
-  # Stage 4: Merge to 10x10 grid (256 ch), ViL Blocks (1 block, 256 ch) -> S4_out (for P5_img)
-  - [-1, 1, PatchMerger,         [384, 100]]                     # 7: [B, 100, 256] (10*10=100)
-  - [-1, 1, ViLBlockPairBlock,  [384, 384, {seqlens: [10,10], chunk_size: 64, conv_kind: '2d', qkv_block_size: 128}]]  # 8: S4_out [B, 100, 256]
+  # Stage 4: 10x10 grid
+  - [-1, 1, PatchMerger,        [384, 100]]                      # 7: [B, 100, 384]
+  - [-1, 1, ViLBlockPairBlock, [384, 384, {seqlens: [10,10],  chunk_size: 64,  conv_kind: '2d', qkv_Block_size: 64, drop_path: 0.067}]] # 8
 
   # Convert sequence features from backbone to images for the FPN head
-  - [2, 1, SequenceToImage, [[80,80]]]                           # 9: P2_img [B, 256, 80, 80] (from S1_out layer 2)
-  - [4, 1, SequenceToImage, [[40,40]]]                           # 10: P3_img [B, 256, 40, 40] (from S2_out layer 4)
-  - [6, 1, SequenceToImage, [[20,20]]]                           # 11: P4_img [B, 256, 20, 20] (from S3_out layer 6)
-  - [8, 1, SequenceToImage, [[10,10]]]                           # 12: P5_img [B, 256, 10, 10] (from S4_out layer 8)
+  - [2, 1, SequenceToImage, [[80,80]]]                           # 9:  P2_img [B, 384, 80, 80]
+  - [4, 1, SequenceToImage, [[40,40]]]                           # 10: P3_img [B, 384, 40, 40]
+  - [6, 1, SequenceToImage, [[20,20]]]                           # 11: P4_img [B, 384, 20, 20]
+  - [8, 1, SequenceToImage, [[10,10]]]                           # 12: P5_img [B, 384, 10, 10]
 
-# Head (FPN + Detection) using 4 levels (P2, P3, P4, P5), all 256 channels for detection
+# Head (FPN + Detection) using 4 levels (P2, P3, P4, P5), all 384 channels for detection
 head:
   # Top-Down Path
-  # P5_td (base is P5_img - layer 12)
-  - [12, 1, nn.Upsample, [None, 2, "nearest"]]                   # 13: Upsampled P5_img [B, 256, 20, 20]
-  - [[13, 11], 1, Concat, [1]]                                   # 14: Concat(layer 13, P4_img layer 11) [B, 512, 20, 20]
-  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [20,20], chunk_size: 256, conv_kind: '2d', mlp_ratio: 4.0, qkv_block_size: 128}]] # 15: P4_td_out [B, 256, 20, 20]
+  - [12, 1, nn.Upsample, [None, 2, "nearest"]]                   # 13: [B, 384, 20, 20]
+  - [[13, 11], 1, Concat, [1]]                                   # 14: [B, 768, 20, 20]
+  # ViL fusion @ 20x20
+  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [20,20], chunk_size: 256, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 64, drop_path: 0.089}]] # 15
 
   # P3_td
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                   # 16: Upsampled P4_td_out [B, 256, 40, 40]
-  - [[16, 10], 1, Concat, [1]]                                   # 17: Concat(layer 16, P3_img layer 10) [B, 512, 40, 40]
-  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [40,40], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_block_size: 128}]] # 18: P3_td_out [B, 256, 40, 40]
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                   # 16: [B, 384, 40, 40]
+  - [[16, 10], 1, Concat, [1]]                                   # 17: [B, 768, 40, 40]
+  # ViL fusion @ 40x40
+  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [40,40], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 64, drop_path: 0.111}]] # 18
 
   # P2_td
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                   # 19: Upsampled P3_td_out [B, 256, 80, 80]
-  - [[19, 9], 1, Concat, [1]]                                    # 20: Concat(layer 19, P2_img layer 9) [B, 512, 80, 80]
-  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [80,80], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_block_size: 128}]] # 21: P2_detect_feat [B, 256, 80, 80]
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                   # 19: [B, 384, 80, 80]
+  - [[19, 9], 1, Concat, [1]]                                    # 20: [B, 768, 80, 80]
+  # ViL fusion @ 80x80
+  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [80,80], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 64, drop_path: 0.133}]] # 21
 
   # Bottom-Up Path
-  # P3_detect
-  - [21, 1, Conv, [384, 3, 2]]                                   # 22: Downsampled P2_detect_feat [B, 256, 40, 40]
-  - [[22, 18], 1, Concat, [1]]                                   # 23: Concat(layer 22, P3_td_out layer 18) [B, 512, 40, 40]
-  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [40,40], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_block_size: 128}]] # 24: P3_detect_feat [B, 256, 40, 40]
+  - [21, 1, Conv, [384, 3, 2]]                                   # 22: [B, 384, 40, 40]
+  - [[22, 18], 1, Concat, [1]]                                   # 23: [B, 768, 40, 40]
+  # ViL fusion @ 40x40
+  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [40,40], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 64, drop_path: 0.156}]] # 24
 
-  # P4_detect
-  - [-1, 1, Conv, [384, 3, 2]]                                   # 25: Downsampled P3_detect_feat [B, 256, 20, 20]
-  - [[25, 15], 1, Concat, [1]]                                   # 26: Concat(layer 25, P4_td_out layer 15) [B, 512, 20, 20]
-  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [20,20], chunk_size: 256, conv_kind: '2d', mlp_ratio: 4.0, qkv_block_size: 128}]] # 27: P4_detect_feat [B, 256, 20, 20]
+  - [-1, 1, Conv, [384, 3, 2]]                                   # 25: [B, 384, 20, 20]
+  - [[25, 15], 1, Concat, [1]]                                   # 26: [B, 768, 20, 20]
+  # ViL fusion @ 20x20
+  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [20,20], chunk_size: 256, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 64, drop_path: 0.178}]] # 27
 
-  # P5_detect
-  - [-1, 1, Conv, [384, 3, 2]]                                   # 28: Downsampled P4_detect_feat [B, 256, 10, 10]
-  - [[28, 12], 1, Concat, [1]]                                   # 29: Concat(layer 28, P5_img layer 12) [B, 512, 10, 10]
-  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [10,10], chunk_size: 64, conv_kind: '2d', mlp_ratio: 4.0, qkv_block_size: 128}]] # 30: P5_detect_feat [B, 256, 10, 10]
+  - [-1, 1, Conv, [384, 3, 2]]                                   # 28: [B, 384, 10, 10]
+  - [[28, 12], 1, Concat, [1]]                                   # 29: [B, 768, 10, 10]
+  # ViL fusion @ 10x10
+  - [-1, 1, ViLFusionBlock, [768, 384, {seqlens: [10,10], chunk_size: 64,  conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 64, drop_path: 0.200}]] # 30
 
   # Detection Head
-  - [[21, 24, 27, 30], 1, v10Detect, [nc]]                       # 31: Detect on P2 (layer 21), P3 (layer 24), P4 (layer 27), P5 (layer 30)
+  - [[21, 24, 27, 30], 1, v10Detect, [nc]]                       # 31

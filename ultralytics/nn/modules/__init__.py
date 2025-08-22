@@ -74,8 +74,12 @@ from .block import (
     PermuteBlock,
     FlattenPosEmbedBlock,
     PatchMerging,
-    ViLBlock,
-    SimpleStem
+    SimpleStem,
+    SwinPatchExpandBlock,
+    SwinPatchMergeBlock,
+    WindowedViLBlockPairBlock,
+    WindowedViLFusionBlock,
+    PermuteBlock
 )
 from .conv import (
     CBAM,

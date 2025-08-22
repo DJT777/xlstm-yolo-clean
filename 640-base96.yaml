@@ -1,0 +1,59 @@
+# YOLO-ViL model configuration for 640x640 input, BASE DIM = 96, linear DropPath capped at 0.05
+ch: 3
+nc: 80
+imgsz: 640
+scales:
+  n: [1.00, 1.00, 1024]
+  s: [1.00, 1.00, 1024]
+  m: [1.00, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# Backbone
+backbone:
+  - [-1, 1, VitPatchEmbedBlock, [3, 96, [640,640], [8,8]]]
+  - [-1, 1, VitPosEmbedBlock,  [96, 96, [80,80]]]
+
+  - [-1, 1, ViLBlockPairBlock, [96, 96, {seqlens: [80,80],  chunk_size: 512, conv_kind: '2d', qkv_Block_size: 16, drop_path: 0}]]  # 2
+
+  - [-1, 1, PatchMerger,        [96, 1600]]
+  - [-1, 1, ViLBlockPairBlock, [96, 96, {seqlens: [40,40],  chunk_size: 512, conv_kind: '2d', qkv_Block_size: 16, drop_path: 0}]]  # 4
+
+  - [-1, 1, PatchMerger,        [96, 400]]
+  - [-1, 1, ViLBlockPairBlock, [96, 96, {seqlens: [20,20],  chunk_size: 256, conv_kind: '2d', qkv_Block_size: 16, drop_path: 0}]]  # 6
+
+  - [-1, 1, PatchMerger,        [96, 100]]
+  - [-1, 1, ViLBlockPairBlock, [96, 96, {seqlens: [10,10],  chunk_size: 64,  conv_kind: '2d', qkv_Block_size: 16, drop_path: 0}]]  # 8
+
+  - [2, 1, SequenceToImage, [[80,80]]]
+  - [4, 1, SequenceToImage, [[40,40]]]
+  - [6, 1, SequenceToImage, [[20,20]]]
+  - [8, 1, SequenceToImage, [[10,10]]]
+
+# Head
+head:
+  - [12, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[13, 11], 1, Concat, [1]]
+  - [-1, 1, ViLFusionBlock, [192, 96, {seqlens: [20,20], chunk_size: 256, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 16, drop_path: 0}]]  # 15
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[16, 10], 1, Concat, [1]]
+  - [-1, 1, ViLFusionBlock, [192, 96, {seqlens: [40,40], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 16, drop_path: 0}]]  # 18
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[19, 9], 1, Concat, [1]]
+  - [-1, 1, ViLFusionBlock, [192, 96, {seqlens: [80,80], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 16, drop_path: 0}]]  # 21
+
+  - [21, 1, Conv, [96, 3, 2]]
+  - [[22, 18], 1, Concat, [1]]
+  - [-1, 1, ViLFusionBlock, [192, 96, {seqlens: [40,40], chunk_size: 512, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 16, drop_path: 0}]]  # 24
+
+  - [-1, 1, Conv, [96, 3, 2]]
+  - [[25, 15], 1, Concat, [1]]
+  - [-1, 1, ViLFusionBlock, [192, 96, {seqlens: [20,20], chunk_size: 256, conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 16, drop_path: 0}]]  # 27
+
+  - [-1, 1, Conv, [96, 3, 2]]
+  - [[28, 12], 1, Concat, [1]]
+  - [-1, 1, ViLFusionBlock, [192, 96, {seqlens: [10,10], chunk_size: 64,  conv_kind: '2d', mlp_ratio: 4.0, qkv_Block_size: 16, drop_path: 0}]]  # 30
+
+  - [[21, 24, 27, 30], 1, v10Detect, [nc]]

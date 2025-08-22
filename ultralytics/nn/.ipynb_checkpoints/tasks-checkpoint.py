@@ -6,6 +6,7 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+import math
 
 import torch
 
@@ -75,7 +76,16 @@ from ultralytics.nn.modules import (
     VisionClueMerge,
     ViLFusionBlock,
     ViLLayerNormBlock,
-    PatchMerger
+    PatchMerger,
+    PermuteBlock,
+    FlattenPosEmbedBlock,
+    PatchMerging,
+    ViLBlock,
+    SimpleStem,
+    SwinPatchMergeBlock,
+    SwinPatchExpandBlock,
+    WindowedViLBlockPairBlock,
+    WindowedViLFusionBlock
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -145,7 +155,90 @@ class BaseModel(torch.nn.Module):
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize, embed)
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    # def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    #     """
+    #     Perform a dynamic, multi-scale-aware forward pass through the network.
+
+    #     This implementation tracks the spatial dimensions of feature maps at runtime
+    #     and dynamically configures each module's `seqlens` attribute before execution,
+    #     enabling the model to handle variable input resolutions.
+    #     """
+    #     y, dt, embeddings = [], [], []  # outputs
+        
+    #     # A map to store the sequence lengths [H, W] for each saved layer's output
+    #     seqlens_map = {}
+        
+    #     for m in self.model:
+    #         # 1. Determine the input tensor(s) and the corresponding seqlens
+    #         if m.f != -1:  # if not from the previous layer
+    #             # Handle multiple inputs from earlier layers
+    #             if isinstance(m.f, int):
+    #                 x = y[m.f]
+    #                 current_seqlens = seqlens_map.get(m.f)
+    #             else:
+    #                 x = [x if j == -1 else y[j] for j in m.f]
+    #                 # For Concat, seqlens are the same; take from the first feature map
+    #                 current_seqlens = seqlens_map.get(m.f[0])
+    #         else:
+    #             # Initial input from the dataloader, no seqlens yet
+    #             current_seqlens = None
+
+    #         # 2. Dynamically patch the seqlens attribute if the module needs it
+    #         # This is the key step for enabling multi-scale capability.
+    #         if hasattr(m, "seqlens") and current_seqlens:
+    #             if isinstance(m, (SwinPatchMergeBlock, SwinPatchExpandBlock)):
+    #                 # These blocks take seqlens as a constructor tuple in the YAML,
+    #                 # so we update the first element of that tuple.
+    #                 # e.g., m.args[0] = [[H,W], merge_factor, in_dim, out_dim]
+    #                 # We create a new instance of the internal patch merging/expanding
+    #                 # logic with the correct, dynamic resolution.
+    #                 m.seqlens = tuple(current_seqlens)
+    #                 if isinstance(m, SwinPatchMergeBlock):
+    #                     m.pm = PatchMerging(c1=m.in_dim, norm_layer=nn.RMSNorm)
+    #                 # SwinPatchExpandBlock handles dynamic resolution internally
+    #                 # by checking the input tensor shape, so we only need to set seqlens.
+    #             else:
+    #                 # For other modules like WindowedViL, we can directly set the attribute.
+    #                 m.seqlens = current_seqlens
+    #                 m.H, m.W = current_seqlens[0], current_seqlens[1]
+
+
+    #         if profile:
+    #             self._profile_one_layer(m, x, dt)
+            
+    #         # 3. Run the module
+    #         x = m(x)
+
+    #         # 4. Calculate and store the output seqlens for the next layers
+    #         output_seqlens = current_seqlens
+    #         if isinstance(m, VitPatchEmbedBlock):
+    #             # After the first patch embedding, we get the initial sequence length
+    #             output_seqlens = list(x.shape[1:3])
+    #         elif isinstance(m, SwinPatchMergeBlock):
+    #             # Downsampling halves the spatial dimensions
+    #             output_seqlens = [s // 2 for s in current_seqlens]
+    #         elif isinstance(m, SwinPatchExpandBlock):
+    #             # Upsampling doubles the spatial dimensions
+    #             output_seqlens = [s * m.scale for s in current_seqlens]
+    #         elif isinstance(m, Conv) and any(s > 1 for s in m.s):
+    #             # Handle standard strided convolution for downsampling
+    #             h, w = current_seqlens
+    #             stride_h, stride_w = m.s if isinstance(m.s, tuple) else (m.s, m.s)
+    #             output_seqlens = [h // stride_h, w // stride_w]
+            
+    #         # Save the output tensor and its corresponding sequence lengths
+    #         y.append(x if m.i in self.save else None)
+    #         if m.i in self.save:
+    #             seqlens_map[m.i] = output_seqlens
+            
+    #         if embed and m.i in embed:
+    #             embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
+    #             if m.i == max(embed):
+    #                 return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                    
+    #     return x
+
+    def _predict_once(self, x, profile=True, visualize=False, embed=None):
         """
         Perform a forward pass through the network.
 
@@ -158,6 +251,7 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
+        #profile = True
         y, dt, embeddings = [], [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -345,7 +439,7 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 512 # 2x min stride
+            s = 640 # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
@@ -1197,12 +1291,30 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is PatchMergeBlock:
             c1 = ch[f]
             c2 = args[3]  # out_dim from args, e.g., 512 or 1024
+        elif m is SwinPatchMergeBlock:
+            # args = [[H,W], scale, in_dim, out_dim]
+            c1 = ch[f]
+            # Force in_dim to match the actual incoming channels
+            if len(args) >= 3:
+                args[2] = c1
+            c2 = args[3]  # out_dim
+        elif m is SwinPatchExpandBlock:
+            # args = [[H,W], in_dim, out_dim, {return:...}]
+            c1 = ch[f]
+            if len(args) >= 2:
+                args[1] = c1  # enforce in_dim
+            c2 = args[2]      # out_dim after expand (when return='image', this is the 2D feature map channels)
+        elif m is PatchMerging: # <<< MODIFIED/ADDED BLOCK
+            c1 = ch[f]
+            c2 = 2 * c1  # SWIN doubles the input dimension
+            args = [c1]  # PatchMerging __init__ takes c1 (as in_dim)
         # elif m is ViLPairBlockWrapper:
         #     c1 = ch[f]
         #     c2 = args[0]  # dim from args, e.g., 256, 512, or 1024
-        elif m in {ViLBlockPairBlock, ViLFusionBlock}:
-            c1 = ch[f]            
-            c2 = args[1]  # c2 from args3
+        # in ultralytics/nn/tasks.py:parse_model(...)
+        elif m in {ViLBlockPairBlock, ViLFusionBlock, ViLBlock, WindowedViLBlockPairBlock, WindowedViLFusionBlock}:
+            c1 = ch[f]
+            c2 = args[1]
         elif m is VisionClueMerge:
             c1 = ch[f]
             c2 = args[1]  # c2 from args

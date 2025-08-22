@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Optional, Tuple
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
@@ -66,8 +66,21 @@ __all__ = (
     "PatchMergeBlock",
     "ViLFusionBlock"
     "ViLLayerNormBlock",
-    "PatchMerger"
+    "PatchMerger",
+    "PermuteBlock",
+    "FlattenPosEmbedBlock",
+    "PatchMerging",
 )
+
+import math
+
+def propagate_seqlens(root: torch.nn.Module, hw: tuple[int, int]):
+    """Set .seqlens on every submodule that exposes it (duck-typed)."""
+    hw = (int(hw[0]), int(hw[1]))
+    def _setter(m: torch.nn.Module):
+        if hasattr(m, "seqlens"):
+            m.seqlens = hw
+    root.apply(_setter)
 
 
 class DFL(nn.Module):
@@ -1529,278 +1542,17 @@ class SequenceConv2dBlock(nn.Module):
         #print(f"Layer {self.i}: SequenceConv2dBlock output shape: {x.shape}")
         return x
 
-
 class SequenceToImage(nn.Module):
     """
-    A module that reshapes a flattened sequence tensor into either a 2D image or a 3D video sequence
-    based on the number of dimensions provided in the sequence lengths.
-
-    Args:
-        *args: Variable length argument list. If a single argument is provided and it is a list or tuple,
-               it is unpacked to set the sequence lengths (seqlens). Otherwise, args should directly
-               contain the sequence lengths (e.g., H, W or T, H, W).
-        **kwargs: Additional keyword arguments (not used).
-
-    Attributes:
-        seqlens (tuple): The sequence lengths defining the target shape.
-                         - If len(seqlens) == 2: reshapes to (B, D, H, W) for an image.
-                         - If len(seqlens) == 3: reshapes to (B, T, H, W, D) for a video sequence.
-
-    Raises:
-        ValueError: If seqlens is not a list or tuple of length 2 or 3, if its elements are not integers,
-                    or if the input sequence length S does not match the product of seqlens.
+    Converts flattened sequence [B, H*W, C] back to image [B, C, H, W] using dynamic seqlens.
     """
-
-    def __init__(self, *args, **kwargs):
+    def __init__(self, seqlens):
         super().__init__()
-        # Handle case where seqlens is passed as a single list/tuple (e.g., [H, W] or [T, H, W])
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-        self.seqlens = args
-        # Validate seqlens
-        if not isinstance(self.seqlens, (list, tuple)) or len(self.seqlens) not in [2, 3]:
-            raise ValueError("seqlens must be a list or tuple of length 2 or 3")
-        if not all(isinstance(dim, int) for dim in self.seqlens):
-            raise ValueError("All elements in seqlens must be integers")
+        self.seqlens = seqlens  # Initial from YAML, overridden per-batch
 
-    def forward(self, x):
-        """
-        Reshape the input tensor based on the number of dimensions in seqlens.
-
-        Args:
-            x (Tensor): Input tensor of shape (B, S, D), where B is batch size, S is sequence length,
-                        and D is the feature dimension.
-
-        Returns:
-            Tensor: Reshaped tensor.
-                    - If len(seqlens) == 2: (B, D, H, W) for an image.
-                    - If len(seqlens) == 3: (B, T, H, W, D) for a video sequence.
-
-        Raises:
-            ValueError: If the sequence length S does not match the product of seqlens dimensions.
-        """
-        B, S, D = x.shape
-        if len(self.seqlens) == 2:
-            # 2D case: reshape to image (B, D, H, W)
-            H, W = self.seqlens
-            if S != H * W:
-                raise ValueError(f"Sequence length {S} does not match seqlens {H}*{W}={H*W}")
-            x = x.view(B, H, W, D).permute(0, 3, 1, 2)  # (B, D, H, W)
-        elif len(self.seqlens) == 3:
-            # 3D case: reshape to video sequence (B, T, H, W, D)
-            T, H, W = self.seqlens
-            if S != T * H * W:
-                raise ValueError(f"Sequence length {S} does not match seqlens {T}*{H}*{W}={T*H*W}")
-            x = x.view(B, T, H, W, D)  # (B, T, H, W, D)
-        return x
-    
-class VitPatchEmbedBlock(nn.Module):
-    """
-    A block that wraps VitPatchEmbed for Ultralytics YAML integration, converting input tensors into patch embeddings.
-
-    Args:
-        *args: Variable length argument list, typically [c1, c2, resolution, patch_size].
-            - c1 (int): Input channels (total, e.g., num_channels * num_frames for 3D).
-            - c2 (int): Embedding dimension (dim).
-            - resolution (list/tuple): Input resolution, e.g., [H, W] for 2D or [T, H, W] for 3D.
-            - patch_size (int or list/tuple): Patch size, e.g., P for 2D ([P, P]) or [T_patch, H_patch, W_patch] for 3D.
-        **kwargs: Additional arguments.
-            - init_weights (str): Weight initialization method ('xavier_uniform' or 'torch', default: 'xavier_uniform').
-
-    Input:
-        x (torch.Tensor): Input tensor.
-            - For 2D: Shape (B, C, H, W).
-            - For 3D: Shape (B, C*T, H, W), where C is channels per frame, T is number of frames.
-
-    Output:
-        torch.Tensor: Patch embeddings.
-            - For 2D: Shape (B, H', W', dim).
-            - For 3D: Shape (B, T', H', W', dim), where T' = T // T_patch, etc.
-
-    YAML Example:
-        - [-1, 1, VitPatchEmbedBlock, [12, 256, [4, 256, 256], [1, 16, 16]]]
-          # c1=12 (3 channels * 4 frames), c2=256 (dim), resolution=[T=4, H=256, W=256], patch_size=[1, 16, 16]
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        # Handle Ultralytics YAML parsing where args is a single list
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-         
-        c1, c2, resolution, patch_size = args
-        self.ndim = len(resolution)
-        
-        # For 3D sequences, c1 is total channels (C * T), so compute channels per frame
-        num_frames = resolution[0] if self.ndim == 3 else 1
-        num_channels = c1 // num_frames
-        
-        # Initialize the VitPatchEmbed module
-        self.module = VitPatchEmbed(
-            dim=c2,
-            num_channels=num_channels,
-            resolution=resolution,
-            patch_size=patch_size,
-            init_weights=kwargs.get('init_weights', 'xavier_uniform')
-        )
-        self.seqlens = self.module.seqlens  # e.g., [T', H', W'] for 3D or [H', W'] for 2D
-
-    def forward(self, x):
-        return self.module(x)  # Outputs (B, T', H', W', dim) for 3D or (B, H', W', dim) for 2D
-
-
-
-class VitPosEmbedBlock(nn.Module):
-    """
-    A block that wraps VitPosEmbed for Ultralytics YAML integration, adding positional embeddings to patch embeddings.
-
-    Args:
-        *args: Variable length argument list, typically [c1, c2, seqlens].
-            - c1 (int): Input dimension (must equal c2, included for YAML compatibility).
-            - c2 (int): Embedding dimension (dim).
-            - seqlens (list/tuple): Sequence lengths, e.g., [H', W'] for 2D or [T', H', W'] for 3D.
-        **kwargs: Additional arguments.
-            - is_learnable (bool): Use learnable embeddings if True (default: False).
-            - allow_interpolation (bool): Allow resizing embeddings if True (default: True).
-            - interpolate_offset (float): Offset for interpolation (default: None).
-
-    Input:
-        x (torch.Tensor): Patch embeddings.
-            - For 2D: Shape (B, H', W', dim).
-            - For 3D: Shape (B, T', H', W', dim).
-
-    Output:
-        torch.Tensor: Patch embeddings with positional embeddings added, same shape as input.
-
-    YAML Example:
-        - [-1, 1, VitPosEmbedBlock, [256, 256, [4, 16, 16]]]
-          # c1=256 (input dim), c2=256 (dim), seqlens=[T'=4, H'=16, W'=16]
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        # Handle Ultralytics YAML parsing where args is a single list
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-        
-        c1, c2, seqlens = args
-        assert c1 == c2, "Input and output dimensions must be equal for positional embedding"
-        
-        # Initialize the VitPosEmbed module
-        self.module = VitPosEmbed(
-            seqlens=seqlens,
-            dim=c2,
-            is_learnable=kwargs.get('is_learnable', True),
-            allow_interpolation=kwargs.get('allow_interpolation', True),
-            interpolate_offset=kwargs.get('interpolate_offset', None)
-        )
-        self.seqlens = seqlens
-
-    def forward(self, x):
-        return self.module(x)  # Adds positional embeddings, preserving input shape
-  
-
-import torch
-import torch.nn as nn
-
-class ViLBlockPairBlock(nn.Module):
-    """
-    A block for VisionLSTM that processes sequence features without managing hidden states.
-    Designed for object detection, handling features and returning output tensors.
-
-    Args:
-        c1 (int): Input channel dimension (typically from previous layer).
-        c2 (int): Output channel dimension (e.g., 256).
-        config (dict): Configuration dictionary with keys like 'seqlens', 'chunk_size', etc.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        # Handle args from YAML parsing (if necessary)
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-        c1, c2, config = args if len(args) > 2 else (args[0], args[1], {})
-
-        self.c1 = c1  # Input channels
-        self.c2 = c2  # Output channels (dim)
-        self.config = config
-        # print(config)
-
-        # Extract sequence lengths (e.g., [H, W] for 2D or [T, H, W] for 3D)
-        seqlens = config.get("seqlens")
-        if not seqlens:
-            raise ValueError("seqlens is required in config for ViLBlockPairBlock")
-        if not isinstance(seqlens, (list, tuple)):
-            raise ValueError("seqlens must be a list or tuple")
-
-        # Determine mode and compute the expected sequence length
-        if len(seqlens) == 2:
-            self.mode = "2d"
-            self.expected_seq = seqlens[0] * seqlens[1]  # H * W
-        elif len(seqlens) == 3:
-            self.mode = "3d"
-            self.expected_seq = seqlens[0] * seqlens[1] * seqlens[2]  # T * H * W
-            # If conv_kind hasn't been explicitly set to "3d", override it
-            if config.get("conv_kind", "2d") != "3d":
-                config["conv_kind"] = "3d"
-        else:
-            raise ValueError("seqlens must be a list/tuple of length 2 (2D) or 3 (3D)")
-
-        # print(seqlens)
-        # print(config.get("chunk_size", 256))
-        # Initialize the underlying ViLBlockPair without hidden state management
-        #print("BLOCK SIZE " + str(config.get("qkv_block_size", 16)))
-        self.module = ViLBlockPair(
-            dim=c2,
-            drop_path=config.get("drop_path", 0.00),
-            conv_kind=config.get("conv_kind", "2d"),
-            conv_kernel_size=config.get("conv_kernel_size", 3),
-            proj_bias=config.get("proj_bias", True),
-            norm_bias=config.get("norm_bias", True),
-            seqlens=seqlens,
-            qkv_block_size = config.get("qkv_block_size", 16),
-            num_blocks=config.get("num_blocks", None),
-            init_weights=config.get("init_weights", "original"),
-            chunk_size=config.get("chunk_size", 256),
-        )
-        self.seqlens = seqlens  # Store for reference
-
-    def forward(self, x):
-        """
-        Forward pass of the block, processing input and returning only the output tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, S, D), where S = expected sequence length.
-                               For 2D, S = H * W; for 3D, S = T * H * W.
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, S, D).
-        """
-        if not isinstance(x, torch.Tensor):
-            raise ValueError(f"Expected x to be a torch.Tensor, got {type(x)}")
-        # print("SHAPE OF VIL INPUT" + str(x.shape))
-
-        #flatten to 1d
-        x = einops.rearrange(x, "b ... d -> b (...) d")
-        B, S, D = x.shape
-
-        # # Check that the sequence length matches the expected product of seqlens dims
-        # assert S == self.expected_seq, (
-        #     f"Input sequence length {S} does not match expected {self.expected_seq} "
-        #     f"computed from seqlens {self.seqlens}"
-        # )
-        # Check feature dimension matches
-        assert D == self.c2, f"Input dimension {D} does not match expected {self.c2}"
-
-
-        # Stateless forward pass through the underlying module
-        out = self.module(x)
-        return out
-        
-
-class SequenceToImage(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-        self.seqlens = args
+    def set_seqlens(self, hw):
+        self.seqlens = [int(h) for h in hw]
+        return self
 
     def forward(self, x):
         B, S, D = x.shape
@@ -1810,12 +1562,102 @@ class SequenceToImage(nn.Module):
                 raise ValueError(f"Sequence length {S} does not match seqlens {h}*{w}={h*w}")
             return x.view(B, h, w, D).permute(0, 3, 1, 2)  # (B, D, H, W) for 2D
         elif len(self.seqlens) == 3:
-            t, h, w = self.seqlens
-            if S != t * h * w:
-                raise ValueError(f"Sequence length {S} does not match seqlens {t}*{h}*{w}={t*h*w}")
-            return x.view(B, t, h, w, D)  # (B, T, H, W, D) for 3D
+            d, h, w = self.seqlens
+            if S != d * h * w:
+                raise ValueError(f"Sequence length {S} does not match seqlens {d}*{h}*{w}={d*h*w}")
+            return x.view(B, d, h, w, D).permute(0, 4, 1, 2, 3)  # (B, D, Dep, H, W) for 3D
         else:
-            raise ValueError("Unsupported seqlens dimension")
+            raise ValueError(f"Unsupported seqlens dimensions: {len(self.seqlens)}")
+    
+class VitPatchEmbedBlock(nn.Module):
+    """
+    Wrapper for VitPatchEmbed. Assumes channels-first input (B,C,H,W)
+    and produces channels-last output (B,H',W',D).
+    """
+    def __init__(self, c1, c2, resolution, patch_size, stride=None, init_weights="xavier_uniform"):
+        super().__init__()
+        self.module = VitPatchEmbed(
+            dim=c2,
+            num_channels=c1,
+            resolution=resolution,
+            patch_size=patch_size,
+            stride=stride,
+            init_weights=init_weights
+        )
+
+    def forward(self, x):
+        return self.module(x)
+
+
+
+class VitPosEmbedBlock(nn.Module):
+    """
+    Wrapper for VitPosEmbed. Takes channels-last (B,H,W,D) and adds
+    positional embeddings, handling multi-scale inputs via interpolation.
+    """
+    def __init__(self, c1, c2, seqlens, is_learnable=True, allow_interpolation=True):
+        super().__init__()
+        assert c1 == c2, "Input and output dimensions must match for VitPosEmbedBlock"
+        self.module = VitPosEmbed(
+            seqlens=seqlens,
+            dim=c2,
+            is_learnable=is_learnable,
+            allow_interpolation=allow_interpolation
+        )
+
+    def forward(self, x):
+        return self.module(x)
+  
+
+
+class FlattenPosEmbedBlock(nn.Module):
+    """
+    A wrapper for VitPosEmbedBlock that re-embeds flattened sequences by reshaping them to their
+    original grid shape, applying positional embeddings, and flattening them back.
+
+    Args:
+        *args: Variable length argument list, typically [c1, c2, seqlens].
+            - c1 (int): Input dimension (must equal c2).
+            - c2 (int): Embedding dimension.
+            - seqlens (list/tuple): Sequence lengths, e.g., [H, W] for 2D or [T, H, W] for 3D.
+        **kwargs: Additional arguments passed to VitPosEmbedBlock (e.g., is_learnable, allow_interpolation).
+
+    Input:
+        x (torch.Tensor): Flattened patch embeddings of shape [B, L, D], where L = H*W (2D) or T*H*W (3D).
+
+    Output:
+        torch.Tensor: Flattened embeddings with positional embeddings added, shape [B, L, D].
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        # Parse args similar to VitPosEmbedBlock for YAML compatibility
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            args = args[0]
+        c1, c2, seqlens = args
+        assert c1 == c2, "Input and output dimensions must be equal"
+        self.seqlens = seqlens
+        self.module = VitPosEmbedBlock(*args, **kwargs)
+
+    def forward(self, x):
+        # Reshape flattened input [B, L, D] to grid shape based on seqlens
+        if len(self.seqlens) == 2:  # 2D case: [B, H*W, D] -> [B, H, W, D]
+            H, W = self.seqlens
+            x = x.view(-1, H, W, x.shape[-1])
+        elif len(self.seqlens) == 3:  # 3D case: [B, T*H*W, D] -> [B, T, H, W, D]
+            T, H, W = self.seqlens
+            x = x.view(-1, T, H, W, x.shape[-1])
+        else:
+            raise ValueError("seqlens must be length 2 or 3")
+        
+        # Apply positional embeddings using VitPosEmbedBlock
+        x = self.module(x)
+        
+        # Flatten back to [B, L, D]
+        x = x.view(x.shape[0], -1, x.shape[-1])
+        return x
+
+
+
     
 class PatchMergeBlock(nn.Module):
     def __init__(self, *args, **kwargs):
@@ -1954,26 +1796,6 @@ class VisionClueMerge(nn.Module):
         }
 
 
-# class VisionClueMerge(nn.Module):
-#     def __init__(self, dim, out_dim):
-#         super().__init__()
-#         self.hidden = int(dim * 4)
-
-#         self.pw_linear = nn.Sequential(
-#             nn.Conv2d(self.hidden, out_dim, kernel_size=1, stride=1, padding=0),
-#             nn.BatchNorm2d(out_dim),
-#             nn.SiLU()
-#         )
-
-#     def forward(self, x):
-#         y = torch.cat([
-#             x[..., ::2, ::2],
-#             x[..., 1::2, ::2],
-#             x[..., ::2, 1::2],
-#             x[..., 1::2, 1::2]
-#         ], dim=1)
-#         return self.pw_linear(y)
-    
 
 
 class PatchMerger(nn.Module):
@@ -1988,50 +1810,290 @@ class PatchMerger(nn.Module):
         y = torch.einsum('bmn,bnd->bmd', attention, x)  # (B, M, D)
         return y
     
-    
 
-class RGBlock(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,
-                 channels_first=False):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import einops
+
+# Uses the canonical class already present in your file:
+# class PatchMerging(nn.Module):  # 4C -> 2C with RMSNorm
+#   def __init__(self, c1: int, norm_layer=nn.RMSNorm): ...
+#   def forward(self, x: (B,L,C), input_resolution: (H,W)) -> (B, L/4, 2C)
+
+
+class PatchMerging(nn.Module):
+    """
+    Patch Merging Layer using SWIN Transformer's original internal logic.
+    This layer reduces the number of patches (tokens) by a factor of 4
+    (halving height and width) and doubles the feature dimension.
+
+    The constructor expects 'c1' (input channels/feature dimension), which is
+    automatically provided by the Ultralytics `parse_model` function.
+
+    Args:
+        c1 (int): Number of input channels (feature dimension for each patch).
+                  This is referred to as `in_dim` internally.
+        norm_layer (nn.Module, optional): Normalization layer.
+                                          Default: nn.LayerNorm.
+    """
+
+    def __init__(self, c1: int, norm_layer=nn.LayerNorm):
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        hidden_features = int(2 * hidden_features / 3)
-        self.fc1 = nn.Conv2d(in_features, hidden_features * 2, kernel_size=1)
-        self.dwconv = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, bias=True,
-                                groups=hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1)
-        self.drop = nn.Dropout(drop)
+        self.in_dim = c1  # c1 from parse_model is the input dimension
 
-    def forward(self, x):
-        x, v = self.fc1(x).chunk(2, dim=1)
-        x = self.act(self.dwconv(x) + x) * v
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+        # Original SWIN logic: norm on 4*in_dim, then projects to 2*in_dim
+        self.norm = norm_layer(4 * self.in_dim, eps=1e-4)
+        self.reduction = nn.Linear(4 * self.in_dim, 2 * self.in_dim, bias=False)
 
+    def forward(self, x: torch.Tensor, input_resolution: tuple[int, int] = None) -> torch.Tensor:
+        """
+        Apply SWIN's original patch merging logic.
 
-class LSBlock(nn.Module):
-    def __init__(self, in_features, hidden_features=None, act_layer=nn.GELU, drop=0):
-        super().__init__()
-        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=3, padding=3 // 2, groups=hidden_features)
-        self.norm = nn.BatchNorm2d(hidden_features)
-        self.fc2 = nn.Conv2d(hidden_features, hidden_features, kernel_size=1, padding=0)
-        self.act = act_layer()
-        self.fc3 = nn.Conv2d(hidden_features, in_features, kernel_size=1, padding=0)
-        self.drop = nn.Dropout(drop)
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, L, C),
+                              where L = number of input patches (e.g., H*W),
+                              and C = input feature dimension (must match self.in_dim).
+            input_resolution (tuple[int, int], optional):
+                Spatial resolution (H, W) of the input feature map *before*
+                it was flattened into L patches. If None, H and W will be inferred
+                by assuming L is a perfect square (H=W=sqrt(L)).
+                For SWIN's 2x2 merging, H and W must be even.
 
-    def forward(self, x):
-        input = x
-        x = self.fc1(x)
+        Returns:
+            torch.Tensor: Output tensor of shape (B, L/4, 2*C).
+                          The feature dimension is doubled.
+        """
+        B, L, C = x.shape
+        assert C == self.in_dim, \
+            f"Input channel C ({C}) does not match PatchMerging module's in_dim ({self.in_dim})."
+
+        H, W = -1, -1
+        if input_resolution is not None:
+            H, W = input_resolution
+            assert L == H * W, \
+                f"Input feature length L ({L}) does not match H*W ({H*W}) from input_resolution."
+        else:
+            # Attempt to infer H, W assuming square input if not provided
+            sqrt_l = math.sqrt(L)
+            if sqrt_l == int(sqrt_l):
+                H = W = int(sqrt_l)
+            else:
+                raise ValueError(
+                    f"Cannot infer square resolution from L ({L}); provide input_resolution=(H, W)."
+                )
+        assert H % 2 == 0 and W % 2 == 0, \
+            f"For 2x2 merging, H ({H}) and W ({W}) must be even."
+
+        x = x.view(B, H, W, C)
+
+        # Downsample 2x2 patches
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        x = x.view(B, -1, 4 * C)  # B (H/2 * W/2) 4*C
+
         x = self.norm(x)
-        x = self.fc2(x)
-        x = self.act(x)
-        x = self.fc3(x)
-        x = input + self.drop(x)
+        x = self.reduction(x)  # B (H/2 * W/2) 2*C
+
         return x
+
+class SwinPatchMergeBlock(nn.Module):
+    """
+    Streamlined Patch Merging Layer (replaces SwinPatchMergeBlock).
+    Reduces token count by 4x and increases feature dimension by 2x.
+    - Input: (B, H, W, C)
+    - Output: (B, H/2, W/2, 2*C)
+    """
+    def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
+        super().__init__()
+        self.in_dim = c1
+        self.out_dim = c2
+        #assert c2 == 2 * c1, "PatchMergeBlock expects output dim to be 2x input dim."
+
+        self.norm = norm_layer(4 * self.in_dim)
+        self.reduction = nn.Linear(4 * self.in_dim, self.out_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, H, W, C).
+        """
+        assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
+        B, H, W, C = x.shape
+        #assert C == self.in_dim, f"Input channels {C} mismatch expected {self.in_dim}"
+        #assert H % 2 == 0 and W % 2 == 0, f"H ({H}) and W ({W}) must be even."
+
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        cat_x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+
+        merged_x = self.norm(cat_x)
+        merged_x = self.reduction(merged_x)
+        return merged_x
+
+
+
+
+class SwinPatchExpandBlock(nn.Module):
+    """
+    Streamlined Patch Expansion Layer (replaces SwinPatchExpandBlock).
+    Increases token count by 4x and reduces feature dimension by 2x.
+    - Input: (B, H, W, C)
+    - Output: (B, 2*H, 2*W, C/2)
+    """
+    def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
+        super().__init__()
+        self.in_dim = c1
+        self.out_dim = c2
+        #assert c1 == 2 * c2, "PatchExpandBlock expects input dim to be 2x output dim."
+
+        self.expand = nn.Linear(self.in_dim, 2 * self.in_dim, bias=False)
+        self.norm = norm_layer(self.out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, H, W, C).
+        """
+        #assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
+        x_expanded = self.expand(x)
+        B, H, W, C_exp = x_expanded.shape
+
+        x_rearranged = einops.rearrange(x_expanded, 'b h w (p1 p2 c) -> b (h p1) (w p2) c', p1=2, p2=2)
+        x_out = self.norm(x_rearranged)
+        return x_out
+    
+class PatchExpand(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim // 2)
+        self.expand = nn.Linear(dim, 2 * dim, bias=False)
+
+    def forward(self, x):
+        # Assumes x is (B, H, W, C)
+        x = self.expand(x)
+        B, H, W, C = x.shape
+        x = x.view(B, H, W, 2, 2, C // 4)
+        x = x.permute(0, 1, 3, 2, 4, 5)
+        x = x.reshape(B, H * 2, W * 2, C // 4)
+        x = self.norm(x)
+        return x
+
+
+# =======================================================
+# 3) Windowed ViL wrapper (with optional shifted windows)
+# # =======================================================
+#working
+class WindowedViLBlockPairBlock(nn.Module):
+    """
+    Run ViLBlockPairBlock INSIDE local windows of size (Wh, Ww) to cap sequence length per call.
+    Optional second pass with a (Wh//2, Ww//2) spatial roll ("shifted windows") for cross-window mixing.
+
+    YAML args:
+      [c1, c2, {
+        seqlens: [H, W],          # full grid
+        window_size: 8,           # optional (int), default 8
+        window_size_w: null,      # optional (int), default=window_size
+        shifted: true,            # optional (bool), default True
+        ... any ViLBlockPairBlock config ...
+      }]
+
+    Input : (B, S, D) with S=H*W  OR  (B, H, W, D)
+    Output: (B, S, D)
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            args = args[0]
+        c1, c2, config = args if len(args) > 2 else (args[0], args[1], {})
+        self.c2 = int(c2)
+
+        seqlens = config.get("seqlens")
+        assert isinstance(seqlens, (list, tuple)) and len(seqlens) == 2, "WindowedViL requires seqlens=[H,W]"
+        self.H, self.W = map(int, seqlens)
+
+        Wh = int(config.get("window_size", 8))
+        Ww = int(config.get("window_size_w", Wh))
+        self.window = (Wh, Ww)
+
+        self.use_shift = bool(config.get("shifted", True))
+        self.shift = (Wh // 2, Ww // 2) if self.use_shift else (0, 0)
+
+        # Build an inner ViL that operates on window-sized grids
+        inner_cfg = dict(config)
+        inner_cfg["seqlens"] = [Wh, Ww]
+        # Import from your existing module scope
+        # (Assumes ViLBlockPairBlock is already defined in the same file/module.)
+        self.inner = ViLBlockPairBlock(c2, c2, inner_cfg)
+
+    # ---- window helpers ----
+    @staticmethod
+    def _pad_to_multiple(x_bhwd, Wh, Ww):
+        B, H, W, D = x_bhwd.shape
+        ph = (Wh - (H % Wh)) % Wh
+        pw = (Ww - (W % Ww)) % Ww
+        if ph or pw:
+            x_bhwd = F.pad(x_bhwd, (0, 0, 0, pw, 0, ph))  # pad W then H
+        return x_bhwd, H, W, ph, pw
+
+    @staticmethod
+    def _partition_windows(x_bhwd, Wh, Ww):
+        # (B, H, W, D) -> (B*nW, Wh*Ww, D), plus meta for reverse
+        x_padded, H, W, ph, pw = WindowedViLBlockPairBlock._pad_to_multiple(x_bhwd, Wh, Ww)
+        Hp, Wp = x_padded.shape[1], x_padded.shape[2]
+        win = einops.rearrange(x_padded, "b (nh wh) (nw ww) d -> (b nh nw) (wh ww) d", wh=Wh, ww=Ww)
+        meta = (H, W, Hp, Wp, ph, pw)
+        return win, meta
+
+    @staticmethod
+    def _reverse_windows(win_bld, Wh, Ww, B, D, meta):
+        H, W, Hp, Wp, ph, pw = meta
+        x_padded = einops.rearrange(
+            win_bld, "(b nh nw) (wh ww) d -> b (nh wh) (nw ww) d",
+            b=B, nh=Hp // Wh, nw=Wp // Ww, wh=Wh, ww=Ww
+        )
+        if ph or pw:
+            x_padded = x_padded[:, :H, :W, :]
+        return x_padded  # (B, H, W, D)
+
+    def _one_pass(self, x_bsd, shift=(0, 0)):
+        # Accepts (B, S, D), returns (B, S, D)
+        B, S, D = x_bsd.shape
+        H, W = self.H, self.W
+        assert S == H * W and D == self.c2, f"Expected (B,{H*W},{self.c2}), got {x_bsd.shape}"
+
+        x = einops.rearrange(x_bsd, "b (h w) d -> b h w d", h=H, w=W)
+        if shift != (0, 0):
+            x = torch.roll(x, shifts=(-shift[0], -shift[1]), dims=(1, 2))
+
+        Wh, Ww = self.window
+        win, meta = self._partition_windows(x, Wh, Ww)        # (B*nW, Wh*Ww, D)
+        win = self.inner(win)                                 # window ViL
+        x = self._reverse_windows(win, Wh, Ww, B, D, meta)    # (B, H, W, D)
+
+        if shift != (0, 0):
+            x = torch.roll(x, shifts=(+shift[0], +shift[1]), dims=(1, 2))
+        return einops.rearrange(x, "b h w d -> b (h w) d")
+
+    def forward(self, x):
+        # Normalize input layout to (B, S, D)
+        if x.ndim == 4:  # (B, H, W, D)
+            H, W = self.H, self.W
+            assert x.shape[1] == H and x.shape[2] == W, f"Got {(x.shape[1], x.shape[2])}, expected {(H,W)}"
+            x = einops.rearrange(x, "b h w d -> b (h w) d")
+        elif x.ndim != 3:
+            raise ValueError("Expected (B,S,D) or (B,H,W,D)")
+
+        y = self._one_pass(x, shift=(0, 0))
+        if self.use_shift and all(s > 0 for s in self.shift):
+            y = self._one_pass(y, shift=self.shift)
+        return y
+
     
 
 
@@ -2052,128 +2114,248 @@ class ViLLayerNormBlock(nn.Module):
     def forward(self, x):
         return self.ln(x)
 
-
-
-class ViLFusionBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_dim: int,
-        config: dict,
-        n: int = 1,
-        mlp_ratio: float = 4.0,
-        drop_path: float = 0.0,
-        mlp_act_layer=nn.GELU,
-        mlp_drop_rate: float = 0.0,
-    ):
-        """
-        Initialize the FusionViLBlock, mirroring XSSBlock logic with ViLBlockPairBlock.
-
-        Args:
-            in_channels (int): Number of input channels.
-            hidden_dim (int): Hidden dimension after projection.
-            config (dict): Configuration dict with 'seqlens', etc.
-            n (int): Number of ViLBlockPairBlock repetitions.
-            mlp_ratio (float): Expansion ratio for MLP hidden dimension.
-            drop_path (float): Drop path probability.
-            norm_layer (callable): Normalization layer constructor.
-            mlp_act_layer (type): Activation layer for MLP.
-            mlp_drop_rate (float): Dropout rate for MLP.
-        """
+class SimpleStem(nn.Module):
+    def __init__(self, inp, embed_dim, ks=3):
         super().__init__()
-
-        # print(config)
-        # Extract seqlens from config
-        seqlens = config.get("seqlens")
-        # mlp_ratio = config.get("mlp_ratio")
-        if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
-            raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
-
-        self.seqlens = seqlens
-        self.hidden_dim = hidden_dim
-
-        # Input projection (same as XSSBlock)
-        self.in_proj = (
-            nn.Sequential(
-                nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                nn.SiLU()
-            ) if in_channels != hidden_dim else nn.Identity()
+        self.hidden_dims = embed_dim // 2
+        self.conv = nn.Sequential(
+            nn.Conv2d(inp, self.hidden_dims, kernel_size=ks, stride=2, padding=autopad(ks, d=1), bias=False),
+            nn.BatchNorm2d(self.hidden_dims),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_dims, embed_dim, kernel_size=ks, stride=2, padding=autopad(ks, d=1), bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(),
         )
 
-        # Local spatial processing (LSBlock from XSSBlock)
-        self.lsblock = LSBlock(hidden_dim, hidden_dim)
+    def forward(self, x):
+        x_conv = self.conv(x)  # Output: (B, C, H, W) e.g., (B, 32, 160, 160)
+        # Permute to (B, H, W, C) for channels-last
+        x_permuted = x_conv.permute(0, 2, 3, 1).contiguous()
+        return x_permuted # Output: (B, 160, 160, 32)
 
-        # Normalization for sequence input (B, S, D)
-        self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
 
-        # ViLBlockPairBlock replacing SS2D
-        self.vil = nn.Sequential(*[
-            ViLBlockPairBlock(hidden_dim, hidden_dim, config)
-            for _ in range(n)
-        ])
 
-        # DropPath from vision_lstm_util.py
-        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
 
-        # Optional MLP branch (same as XSSBlock)
-        self.mlp_branch = mlp_ratio > 0
-        if self.mlp_branch:
-            #print("MLP EXISTS!")
-            self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)  # Sequence norm
-            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-            self.mlp = RGBlock(
-                in_features=hidden_dim,
-                hidden_features=mlp_hidden_dim,
-                act_layer=mlp_act_layer,
-                drop=mlp_drop_rate
-            )
+class LSBlock(nn.Module):
+    """
+    Lightweight spatial mixing block with depthwise conv → norm → pointwise convs.
+    Kernel size is configurable.
+    """
+    def __init__(self, in_features, hidden_features=None, act_layer=nn.GELU, drop=0.0, kernel_size: int = 3):
+        super().__init__()
+        hidden_features = hidden_features or in_features
+        pad = kernel_size // 2
+        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=kernel_size,
+                             padding=pad, groups=hidden_features)
+        self.norm = RMSNorm2d(num_channels=hidden_features)
+        self.fc2 = nn.Conv2d(hidden_features, hidden_features, kernel_size=1, padding=0)
+        self.act = act_layer()
+        self.fc3 = nn.Conv2d(hidden_features, in_features, kernel_size=1, padding=0)
+        self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        """
-        Forward pass mirroring XSSBlock logic.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C_in, H, W).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, hidden_dim, H, W).
-        """
-        # Input projection
-        x = self.in_proj(x)  # (B, hidden_dim, H, W)
-
-        # Local spatial processing
-        x_local = self.lsblock(x)  # (B, hidden_dim, H, W)
-
-        # Flatten to sequence for ViLBlockPairBlock
-        B, C, H, W = x_local.shape
-        seq = einops.rearrange(x_local, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
-
-        # Normalize and process with ViLBlockPairBlock
-        #seq_norm = self.norm(seq)  # (B, S, hidden_dim)
-        seq_out = self.vil(seq)  # (B, S, hidden_dim)
-
-        # Apply drop path and residual connection in sequence space
-        seq = seq + self.drop_path(seq_out)  # (B, S, hidden_dim)
-
-        # Reshape back to 4D
-        x_global = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
-
-        # Residual connection with original input
-        x = x + x_global  # (B, hidden_dim, H, W)
-
-        # Optional MLP branch
-        if self.mlp_branch:
-            # Flatten again for MLP (RGBlock expects 4D input)
-            seq = einops.rearrange(x, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
-            # seq_norm = self.norm2(seq)  # (B, S, hidden_dim)
-            # Reshape to 4D for RGBlock
-            x_mlp = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
-            x_mlp = self.mlp(x_mlp)  # (B, hidden_dim, H, W)
-            # Add back with drop path
-            x = x + self.drop_path(x_mlp)  # (B, hidden_dim, H, W)
-
+        identity = x
+        x = self.fc1(x)
+        x = self.norm(x)
+        x = self.fc2(x)
+        x = self.act(x)
+        x = self.fc3(x)
+        x = identity + self.drop(x)
         return x
+
+
+class RGBlock(nn.Module):
+    """
+    Convolutional MLP (RegLU/GELU-friendly) with optional depthwise spatial kernel.
+    Shape-preserving: (B, C, H, W) → (B, C, H, W).
+    """
+    def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3,
+                 drop: float = 0.0, act_layer=nn.GELU):
+        super().__init__()
+        pad = kernel_size // 2
+        self.expand = nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=True)
+        self.dw = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=kernel_size,
+                            padding=pad, groups=hidden_channels, bias=True)
+        self.act = act_layer()
+        self.project = nn.Conv2d(hidden_channels, in_channels, kernel_size=1, bias=True)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        identity = x
+        x = self.expand(x)
+        x = self.dw(x)
+        x = self.act(x)
+        x = self.project(x)
+        x = identity + self.drop(x)
+        return x
+
+
+class RMSNorm2d(nn.Module):
+    """A wrapper for the native RMSNorm to work on 2D channels-first data."""
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        # elementwise_affine=True creates the learnable 'weight' parameter
+        self.norm = nn.RMSNorm(num_channels, eps=eps, elementwise_affine=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+        """
+        # 1. Permute from (B, C, H, W) to (B, H, W, C)
+        x_permuted = x.permute(0, 2, 3, 1)
+        
+        # 2. Apply the native RMSNorm
+        x_normed = self.norm(x_permuted)
+        
+        # 3. Permute back to (B, C, H, W)
+        return x_normed.permute(0, 3, 1, 2)
+
+    
+
+class ViLFusionBlock(nn.Module):
+    """
+    Fusion block operating on channels-first input.
+    Config keys:
+      - ls_kernel_size (int): kernel for LSBlock depthwise conv
+      - rg_kernel_size (int): kernel for RGBlock depthwise conv inside MLP
+      - qkv_block_size, chunk_size, drop_path, etc. passed to ViL stack
+    """
+    def __init__(self, c1, c2, config=None, n=1, mlp_ratio=4.0):
+        super().__init__()
+        cfg = {} if config is None else dict(config)
+        cfg.pop("seqlens", None)
+        ls_k = int(cfg.pop("ls_kernel_size", 3))
+        rg_k = int(cfg.pop("rg_kernel_size", 3))
+        # mlp_ratio = float(cfg.pop("mlp_ratio", 4.0))
+
+        hidden_dim = c2
+
+        self.in_proj = (nn.Sequential(
+            nn.Conv2d(c1, hidden_dim, kernel_size=1, bias=False),
+            RMSNorm2d(num_channels=hidden_dim),
+            nn.SiLU()
+        ) if c1 != hidden_dim else nn.Identity())
+
+        self.lsblock = LSBlock(hidden_dim, hidden_dim, kernel_size=ls_k)
+
+        # n× ViLBlockPairBlock on NHWC
+        self.vil = nn.Sequential(*[
+            ViLBlockPairBlock(hidden_dim, hidden_dim, cfg) for _ in range(int(n))
+        ])
+
+        # Conv-MLP with configurable spatial kernel
+        self.mlp = (RGBlock(hidden_dim, int(hidden_dim * mlp_ratio), kernel_size=rg_k)
+                    if mlp_ratio and mlp_ratio > 0 else nn.Identity())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        assert x.ndim == 4
+        x_proj = self.in_proj(x)                       # (B, C2, H, W)
+        x_local = self.lsblock(x_proj)                 # (B, C2, H, W)
+
+        x_vil_in = x_local.permute(0, 2, 3, 1).contiguous()   # (B, H, W, C2)
+        x_vil_out = self.vil(x_vil_in)                        # (B, H, W, C2)
+        x_global = x_vil_out.permute(0, 3, 1, 2).contiguous() # (B, C2, H, W)
+
+        x_res = x_proj + x_global
+        x_mlp = self.mlp(x_res)
+        return x_res + x_mlp
+
+
+class ViLBlockPairBlock(nn.Module):
+    """
+    NHWC wrapper around ViLBlockPair so it can slot into channels-last pipelines.
+    Accepts and returns (B, H, W, C). Supports in/out dim mismatch with 1x1 linear.
+    """
+    def __init__(self, in_dim: int, out_dim: int, config: Optional[dict] = None):
+        super().__init__()
+        cfg = {} if config is None else dict(config)
+        cfg.pop("seqlens", None)
+        drop_path = float(cfg.pop("drop_path", 0.0))
+        conv_kernel_size = int(cfg.pop("conv_kernel_size", 3))
+
+        # Core pair
+        self.core = ViLBlockPair(dim=out_dim, drop_path=drop_path,
+                                 conv_kernel_size=conv_kernel_size, **cfg)
+
+        # Channel adapters (operate on NHWC)
+        self.in_adapt = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+        self.out_adapt = nn.Identity()  # keep NHWC out_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, H, W, C_in)
+        b, h, w, c = x.shape
+        x = self.in_adapt(x)
+        x = self.core(x)     # (B, H*W, C_out)
+        return x
+
+class WindowedViLFusionBlock(nn.Module):
+    """
+    Wraps ViLFusionBlock with Swin-style windowing. This entire operation can be 
+    gradient-checkpointed by setting ckpt_thresh in the YAML.
+    """
+    def __init__(self, c_in: int, c_out: int, cfg: dict):
+        super().__init__()
+        self.c_in = c_in
+        self.c_out = c_out
+        
+        # New parameter to control checkpointing from YAML
+        self.ckpt_thresh = int(cfg.get("ckpt_thresh", 999999)) # Default high to disable
+
+        ws = cfg.get("window_size", 8)
+        self.ws = int(ws)
+        self.shifted = bool(cfg.get("shifted", False))
+
+        inner = {k: v for k, v in cfg.items() if k != "ckpt_thresh"} # Pass config down without ckpt_thresh
+        inner["seqlens"] = [self.ws, self.ws]
+        
+        self.core = ViLFusionBlock(c_in, c_out, inner)
+
+    # ... (keep all helper methods: _partition, _unpartition) ...
+    def _partition(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        ws = self.ws
+        assert H % ws == 0 and W % ws == 0, f"H={H}, W={W} must be divisible by window_size={ws}"
+        nh = H // ws
+        nw = W // ws
+        xw = x.view(B, C, nh, ws, nw, ws).permute(0, 2, 4, 1, 3, 5).contiguous()
+        xw = xw.view(B * nh * nw, C, ws, ws)
+        return xw, (B, nh, nw, H, W)
+
+    def _unpartition(self, xw: torch.Tensor, shape_info):
+        B, nh, nw, H, W = shape_info
+        ws = self.ws
+        xw = xw.view(B, nh, nw, self.c_out, ws, ws).permute(0, 3, 1, 4, 2, 5).contiguous()
+        x = xw.view(B, self.c_out, H, W)
+        return x
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H, W = x.shape[-2:]
+        S = H * W
+        need_ckpt = self.training and x.requires_grad and S >= self.ckpt_thresh
+
+        def checkpointable_forward(tensor):
+            if self.shifted:
+                shift = self.ws // 2
+                tensor = torch.roll(tensor, shifts=(-shift, -shift), dims=(2, 3))
+            
+            xw, shape_info = self._partition(tensor)
+            yw = self.core(xw)
+            y = self._unpartition(yw, shape_info)
+            
+            if self.shifted:
+                shift = self.ws // 2
+                y = torch.roll(y, shifts=(shift, shift), dims=(2, 3))
+            return y
+
+        if need_ckpt:
+            # This MUST be use_reentrant=False
+            return torch.utils.checkpoint.checkpoint(checkpointable_forward, x, use_reentrant=False)
+        else:
+            return checkpointable_forward(x)
+
 
 # Definition of the PatchMerger class
 class PatchMerger(nn.Module):
@@ -2188,214 +2370,26 @@ class PatchMerger(nn.Module):
         sim = torch.matmul(self.queries, x.transpose(-1, -2)) * self.scale
         attn = sim.softmax(dim=-1)
         return torch.matmul(attn, x)
+    
+class PermuteBlock(nn.Module):
+    """
+    A simple module to permute the dimensions of a tensor.
+    Useful for changing tensor formats, e.g., from channels-last (B,H,W,C)
+    to channels-first (B,C,H,W).
 
-# class ViLFusionBlock(nn.Module):
-#     class _LocalSpatial(nn.Module):
-#         def __init__(self, dim, act_layer=nn.GELU, drop=0.):
-#             super().__init__()
-#             self.dw3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-#             self.bn = nn.BatchNorm2d(dim)
-#             self.pw1 = nn.Conv2d(dim, dim, 1)
-#             self.act = act_layer()
-#             self.pw2 = nn.Conv2d(dim, dim, 1)
-#             self.drop = nn.Dropout(drop)
+    Args:
+        dims (list or tuple): The desired ordering of dimensions.
+    """
+    def __init__(self, dims):
+        super().__init__()
+        self.dims = dims
 
-#         def forward(self, x):
-#             res = x
-#             x = self.pw2(self.act(self.pw1(self.bn(self.dw3(x)))))
-#             return res + self.drop(x)
+    def forward(self, x):
+        """
+        Applies the permutation to the input tensor.
+        """
+        return x.permute(*self.dims)
 
-#     def __init__(self, in_channels, hidden_dim, config):
-#         super().__init__()
-#         seqlens = config["seqlens"]
-#         n_vil = config.get("n_vil", 1)
-#         drop_path = config.get("drop_path", 0.0)
-#         mlp_ratio = config.get("mlp_ratio", 4.0)
-
-#         self.in_proj = (
-#             nn.Sequential(
-#                 nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
-#                 nn.BatchNorm2d(hidden_dim),
-#                 nn.SiLU(),
-#             ) if in_channels != hidden_dim else nn.Identity()
-#         )
-
-#         self.local = ViLFusionBlock._LocalSpatial(hidden_dim)
-
-#         self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
-#         self.vil = nn.Sequential(*[
-#             ViLBlockPair(
-#                 dim=hidden_dim,
-#                 drop_path=drop_path,
-#                 seqlens=seqlens,
-#                 conv_kind="3d" if len(seqlens) == 3 else "2d",
-#             ) for _ in range(n_vil)
-#         ])
-#         self.dp = DropPath(drop_prob=drop_path)
-
-#         self.use_mlp = mlp_ratio > 0
-#         if self.use_mlp:
-#             mlp_hidden = int(hidden_dim * mlp_ratio)
-#             self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
-#             self.mlp = nn.Sequential(
-#                 nn.Conv2d(hidden_dim, mlp_hidden * 2, 1),
-#                 nn.GELU(),
-#                 nn.Conv2d(mlp_hidden, hidden_dim, 1),
-#             )
-#             self.dp2 = DropPath(drop_prob=drop_path)
-
-#     @staticmethod
-#     def _hw_flat(x):
-#         B, D, *spatial = x.shape
-#         return x.flatten(2).transpose(1, 2), spatial
-
-#     @staticmethod
-#     def _hw_unflat(seq, spatial):
-#         B, S, D = seq.shape
-#         return seq.transpose(1, 2).view(B, D, *spatial)
-
-#     def forward(self, x):
-#         x = self.in_proj(x)  # Shape: [B, hidden_dim, H, W]
-#         x_local = self.local(x)  # Shape: [B, hidden_dim, H, W]
-        
-#         seq, spatial = self._hw_flat(x_local)  # seq: [B, S, hidden_dim], spatial: (H, W)
-#         seq_id = seq
-#         seq_res = self.vil(self.norm(seq_id))  # Shape: [B, S, hidden_dim]
-#         seq = self.dp(seq_id, lambda _: seq_res)  # Shape: [B, S, hidden_dim]
-#         x_global = self._hw_unflat(seq, spatial)  # Shape: [B, hidden_dim, H, W]
-        
-#         x = x + x_global  # Shape: [B, hidden_dim, H, W]
-        
-#         if self.use_mlp:
-#             x_id = x  # Shape: [B, hidden_dim, H, W]
-#             # Step 1: Permute to move channel dimension to the end
-#             x_permuted = x_id.permute(0, 2, 3, 1)  # Shape: [B, H, W, hidden_dim]
-#             # Step 2: Apply LayerNorm over the last dimension (hidden_dim = 128)
-#             x_norm = self.norm2(x_permuted)  # Shape: [B, H, W, hidden_dim]
-#             # Step 3: Permute back to original order
-#             x_norm = x_norm.permute(0, 3, 1, 2)  # Shape: [B, hidden_dim, H, W]
-            
-#             x_res = self.mlp(x_norm)  # Shape: [B, hidden_dim, H, W]
-#             x = self.dp2(x_id, lambda _: x_res)  # Shape: [B, hidden_dim, H, W]
-        
-#         return x
-
-# class ViLFusionBlock(nn.Module):
-#     """
-#     XSS‑style fusion layer that uses ViL for the long‑range part and
-#     **re‑implements LSBlock locally** (no external dependency).
-
-#     Parameters
-#     ----------
-#     in_channels : int   # C_in from backbone
-#     hidden_dim  : int   # embedding dimension D
-#     seqlens     : tuple # (H, W) or (T, H, W) – passed to ViLBlockPair
-#     n_vil       : int   # stacked ViLBlockPair layers
-#     drop_path   : float
-#     mlp_ratio   : float # 0 disables the conv‑MLP branch
-#     """
-
-#     # ---------- 1.  LOCAL‑SPATIAL BLOCK (rewritten LSBlock) -----------------
-#     class _LocalSpatial(nn.Module):
-#         """Depth‑wise 3×3 → BN → 1×1 → GELU → 1×1 with residual & dropout
-#         (identical math to LSBlock)"""
-#         def __init__(self, dim, act_layer=nn.GELU, drop=0.):
-#             super().__init__()
-#             self.dw3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)   # depth‑wise
-#             self.bn  = nn.BatchNorm2d(dim)
-#             self.pw1 = nn.Conv2d(dim, dim, 1)
-#             self.act = act_layer()
-#             self.pw2 = nn.Conv2d(dim, dim, 1)
-#             self.drop = nn.Dropout(drop)
-
-#         def forward(self, x):
-#             res = x
-#             x = self.dw3(x)
-#             x = self.bn(x)
-#             x = self.pw1(x)
-#             x = self.act(x)
-#             x = self.pw2(x)
-#             return res + self.drop(x)
-#     # ------------------------------------------------------------------------
-
-#     def __init__(self,
-#                  in_channels: int,
-#                  hidden_dim: int,
-#                  seqlens,
-#                  n_vil: int = 1,
-#                  drop_path: float = 0.,
-#                  mlp_ratio: float = 4.0):
-#         super().__init__()
-
-#         # 2. in‑projection (identical to XSSBlock)
-#         self.in_proj = (
-#             nn.Sequential(
-#                 nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
-#                 nn.BatchNorm2d(hidden_dim),
-#                 nn.SiLU()
-#             ) if in_channels != hidden_dim else nn.Identity()
-#         )
-
-#         # 3. local‑spatial stage (rewritten)
-#         self.local = ViLFusionBlock._LocalSpatial(hidden_dim)
-
-#         # 4. ViL sequence module
-#         self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
-#         self.vil = nn.Sequential(*[
-#             ViLBlockPair(
-#                 dim=hidden_dim,
-#                 drop_path=drop_path,
-#                 seqlens=seqlens,
-#                 conv_kind="3d" if len(seqlens) == 3 else "2d",
-#             ) for _ in range(n_vil)
-#         ])
-#         self.dp = DropPath(drop_path)
-
-#         # 5. optional conv‑MLP branch (same RGBlock maths)
-#         self.use_mlp = mlp_ratio > 0
-#         if self.use_mlp:
-#             mlp_hidden = int(hidden_dim * mlp_ratio)
-#             self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
-#             self.mlp = nn.Sequential(
-#                 nn.Conv2d(hidden_dim, mlp_hidden * 2, 1),
-#                 nn.GELU(),
-#                 nn.Conv2d(mlp_hidden, hidden_dim, 1)  # channel‑mixing conv‑MLP
-#             )
-#             self.dp2 = DropPath(drop_path)
-
-#     # ---------- helper: flatten ↔︎ unflatten -----------------
-#     @staticmethod
-#     def _hw_flat(x):
-#         B, D, *spatial = x.shape
-#         return x.flatten(2).transpose(1, 2), spatial   # (B,S,D), (H,W[,T])
-
-#     @staticmethod
-#     def _hw_unflat(seq, spatial):
-#         B, S, D = seq.shape
-#         return seq.transpose(1, 2).view(B, D, *spatial)
-#     # ---------------------------------------------------------
-
-#     def forward(self, x):
-#         """
-#         x : (B, C_in, H, W)  or  (B, C_in, T, H, W)
-#         """
-#         x = self.in_proj(x)
-
-#         # local spatial conditioning
-#         x_local = self.local(x)
-
-#         # ViL global fusion
-#         seq, spatial = self._hw_flat(x_local)
-#         seq = seq + self.dp(self.vil(self.norm(seq)))
-#         x_global = self._hw_unflat(seq, spatial)
-
-#         x = x + x_global      # first residual
-
-#         # optional MLP
-#         if self.use_mlp:
-#             x = x + self.dp2(self.mlp(self.norm2(x)))
-
-#         return x
 
 nn.ViLLayerNormBlock = ViLLayerNormBlock
 nn.ViLInternalNorm = LayerNorm 

@@ -54,24 +54,60 @@ class DetectionTrainer(BaseTrainer):
         workers = self.args.workers if mode == "train" else self.args.workers * 2
         return build_dataloader(dataset, batch_size, workers, shuffle, rank)  # return dataloader
 
+    # def preprocess_batch(self, batch):
+    #     batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+    #     if self.args.multi_scale:
+    #         imgs = batch["img"]
+    #         # Define scale range: 0.5 for ~320 (lower bound), 1.25 for ~800 (upper bound) on 640 base
+    #         min_scale = 0.5
+    #         max_scale = 1.5
+    #         sf = random.uniform(min_scale, max_scale)  # Uniform random scale factor
+    #         if sf != 1:
+    #             # Compute new size, ensuring multiple of stride (32)
+    #             ns = [math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]]
+    #             # Clamp to bounds if needed (though uniform should stay within)
+    #             ns = [max(320, min(800, s)) for s in ns]  # Optional: Enforce exact bounds
+    #             imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+    #         batch["img"] = imgs
+    #     return batch
+
     def preprocess_batch(self, batch):
-        """Preprocesses a batch of images by scaling and converting to float."""
         batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
         if self.args.multi_scale:
             imgs = batch["img"]
-            sz = (
-                random.randrange(int(self.args.imgsz * 0.5), int(self.args.imgsz * 1.5 + self.stride))
-                // self.stride
-                * self.stride
-            )  # size
-            sf = sz / max(imgs.shape[2:])  # scale factor
+            # Define scale range: 0.5 for ~320 (lower bound), 1.5 for ~960 (upper bound) on 640 base
+            min_scale = 0.7
+            max_scale = 1.3
+            sf = random.uniform(min_scale, max_scale)  # Uniform random scale factor
             if sf != 1:
-                ns = [
-                    math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
-                ]  # new shape (stretched to gs-multiple)
+                # Compute new size, ensuring multiple of stride (32)
+                ns = [math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]]
+                # Clamp to bounds if needed (though uniform should stay within)
+                ns = [max(320, min(960, s)) for s in ns]  # Optional: Enforce exact bounds
                 imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
             batch["img"] = imgs
         return batch
+
+    # def preprocess_batch(self, batch):
+    #     batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+    #     if self.args.multi_scale:
+    #         imgs = batch["img"]
+    #         # Define compatible sizes (multiples of 32 in your desired range)
+    #         # compatible_sizes = [320, 480, 512, 640]
+            
+    #         compatible_sizes = [320, 480, 640, 720, 800]
+    #         # Probabilities corresponding to each size. They must sum to 1.0
+    #         weights =          [0.1, 0.2, 0.4, 0.2, 0.1] 
+
+    #         # Use random.choices() to sample one size based on the weights
+    #         sz = random.choices(compatible_sizes, weights=weights, k=1)[0]
+    #         # sz = random.choice(compatible_sizes)
+    #         sf = sz / max(imgs.shape[2:])  # scale factor
+    #         if sf != 1:
+    #             ns = [math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]]
+    #             imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+    #         batch["img"] = imgs
+    #     return batch
 
     def set_model_attributes(self):
         """Nl = de_parallel(self.model).model[-1].nl  # number of detection layers (to scale hyps)."""
