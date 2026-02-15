@@ -1167,8 +1167,11 @@ class ViLLayer(nn.Module):
                  ffn_round_up_to_multiple_of=64,
                  weight_mode="fused",
                  chunk_size=64,
-                 sd_depth_scale=0.0):
+                 sd_depth_scale=0.0,
+                 **kwargs):
         super().__init__()
+        self.traversal = kwargs.pop('traversal', 'row')
+        assert self.traversal in ['row', 'column'], "traversal must be 'row' or 'column'"
         self.dim = dim
         self.direction = direction
         self.sd_depth_scale = max(0.0, min(1.0, float(sd_depth_scale)))
@@ -1252,8 +1255,12 @@ class ViLLayer(nn.Module):
         self.sd_ffn.drop_prob = scaled
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.sd_attn(x, residual_path=lambda t: self._attn_residual(t))
-        x = self.sd_ffn(x, residual_path=self._ffn_residual)
+        if self.traversal == 'column':
+            x = x.transpose(1, 2).contiguous()
+        x = self.sd_attn(x, residual_path=self._attn_residual)
+        x = self.sd_ffn (x, residual_path=self._ffn_residual)
+        if self.traversal == 'column':
+            x = x.transpose(1, 2).contiguous()
         return x
 
 class ViLBlock(nn.Module):

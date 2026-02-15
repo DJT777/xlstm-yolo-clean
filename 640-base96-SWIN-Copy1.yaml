@@ -1,0 +1,58 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Final Corrected Swin/ViL configuration
+
+nc: 80 
+scales:
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+backbone:
+  - [-1, 1, VitPatchEmbedBlock, [3, 48, [640, 640], [4, 4]]]  # 0
+  - [-1, 1, VitPosEmbedBlock, [48, 48, [160, 160]]]           # 1
+  - [-1, 1, ViLBlockPairBlock, [48, 48, {qkv_block_size: 48, traversal: 'row'}]] # 2
+  - [-1, 1, SwinPatchMergeBlock, [48, 96]]  # 3 (160 -> 80)
+  - [-1, 1, ViLBlockPairBlock, [96, 96, {qkv_block_size: 32, traversal: 'row'}]] # 4
+  - [-1, 1, SwinPatchMergeBlock, [96, 192]] # 5 (80 -> 40)
+  - [-1, 1, ViLBlockPairBlock, [192, 192, {qkv_block_size: 32, traversal: 'row'}]]    # 6
+  - [-1, 1, ViLBlockPairBlock, [192, 192, {qkv_block_size: 32, traversal: 'column'}]] # 7
+  - [-1, 1, ViLBlockPairBlock, [192, 192, {qkv_block_size: 32, traversal: 'row'}]]    # 8
+  - [-1, 1, SwinPatchMergeBlock, [192, 384]] # 9 (40 -> 20)
+  - [-1, 1, ViLBlockPairBlock, [384, 384, {qkv_block_size: 64, traversal: 'row'}]]    # 10
+
+head:
+  - [-1, 1, PermuteBlock, [[0, 3, 1, 2]]]   # 11 (B, 384, 20, 20)
+  - [-1, 1, SPPF, [384, 5]]                 # 12
+  - [-1, 1, PermuteBlock, [[0, 2, 3, 1]]]   # 13 (B, 20, 20, 384)
+
+  # P5 -> P4
+  - [13, 1, SwinPatchExpandBlock, [384, 192]]   # 14 (40x40x192)
+  - [-1, 1, PermuteBlock, [[0, 3, 1, 2]]]       # 15 (B, 192, 40, 40)
+  - [8, 1, PermuteBlock, [[0, 3, 1, 2]]]        # 16 (B, 192, 40, 40)
+  - [[-1, -2], 1, Concat, [1]]                  # 17 (B, 384, 40, 40)
+  # Ensure Fusion Block output matches the next expander input
+  - [-1, 1, ViLFusionBlock, [384, 192, {qkv_block_size: 32}]] # 18 (40x40x192)
+
+  # P4 -> P3
+  - [18, 1, PermuteBlock, [[0, 2, 3, 1]]]       # 19 (B, 40, 40, 192)
+  # This is where the error was. If your implementation of SwinPatchExpandBlock 
+  # uses the second argument for the target dimension, this is correct:
+  - [-1, 1, SwinPatchExpandBlock, [192, 96]]    # 20 (80x80x96)
+  
+  - [-1, 1, PermuteBlock, [[0, 3, 1, 2]]]       # 21 (B, 96, 80, 80)
+  - [4, 1, PermuteBlock, [[0, 3, 1, 2]]]        # 22 (B, 96, 80, 80)
+  - [[-1, -2], 1, Concat, [1]]                  # 23 (B, 192, 80, 80)
+  - [-1, 1, ViLFusionBlock, [192, 96, {qkv_block_size: 32}]]  # 24 (80x80x96)
+
+  # Bottom-up
+  - [24, 1, Conv, [96, 3, 2]]   # 25 (40x40x96)
+  - [[-1, 18], 1, Concat, [1]]  # 26 (B, 288, 40, 40)
+  - [-1, 1, ViLFusionBlock, [288, 192, {qkv_block_size: 32}]]  # 27 (40x40x192)
+
+  - [27, 1, Conv, [192, 3, 2]]  # 28 (20x20x192)
+  - [[-1, 12], 1, Concat, [1]]  # 29 (B, 576, 20, 20)
+  - [-1, 1, ViLFusionBlock, [576, 384, {qkv_block_size: 32}]]  # 30 (20x20x384)
+
+  - [[24, 27, 30], 1, v10Detect, [nc]] # 31

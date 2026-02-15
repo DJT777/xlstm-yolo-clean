@@ -1542,6 +1542,77 @@ class SequenceConv2dBlock(nn.Module):
         #print(f"Layer {self.i}: SequenceConv2dBlock output shape: {x.shape}")
         return x
 
+# class SequenceToImage(nn.Module):
+#     """
+#     Converts flattened sequence [B, H*W, C] back to image [B, C, H, W] using dynamic seqlens.
+#     """
+#     def __init__(self, seqlens):
+#         super().__init__()
+#         self.seqlens = seqlens  # Initial from YAML, overridden per-batch
+
+#     def set_seqlens(self, hw):
+#         self.seqlens = [int(h) for h in hw]
+#         return self
+
+#     def forward(self, x):
+#         B, S, D = x.shape
+#         if len(self.seqlens) == 2:
+#             h, w = self.seqlens
+#             if S != h * w:
+#                 raise ValueError(f"Sequence length {S} does not match seqlens {h}*{w}={h*w}")
+#             return x.view(B, h, w, D).permute(0, 3, 1, 2)  # (B, D, H, W) for 2D
+#         elif len(self.seqlens) == 3:
+#             d, h, w = self.seqlens
+#             if S != d * h * w:
+#                 raise ValueError(f"Sequence length {S} does not match seqlens {d}*{h}*{w}={d*h*w}")
+#             return x.view(B, d, h, w, D).permute(0, 4, 1, 2, 3)  # (B, D, Dep, H, W) for 3D
+#         else:
+#             raise ValueError(f"Unsupported seqlens dimensions: {len(self.seqlens)}")
+    
+
+
+import math
+
+def _infer_square_hw_from_S(S: int):
+    """Infer (H,W) assuming square grid: S = H*H."""
+    h = int(math.isqrt(int(S)))
+    if h * h != int(S):
+        raise ValueError(f"Cannot infer square H,W from sequence length S={S}. Provide seqlens or use square sizes.")
+    return h, h
+
+
+def _set_seqlens_duck(module, hw):
+    """
+    Best-effort propagate current (H,W) into a module without changing its API.
+    Works with common patterns in your codebase and imported VisionLSTM utilities.
+    """
+    H, W = int(hw[0]), int(hw[1])
+
+    # common attribute names
+    if hasattr(module, "seqlens"):
+        try:
+            module.seqlens = [H, W]
+        except Exception:
+            pass
+
+    if hasattr(module, "resolution"):
+        try:
+            module.resolution = (H, W)
+        except Exception:
+            pass
+
+    if hasattr(module, "img_size"):
+        try:
+            module.img_size = (H, W)
+        except Exception:
+            pass
+
+    if hasattr(module, "input_resolution"):
+        try:
+            module.input_resolution = (H, W)
+        except Exception:
+            pass
+
 class SequenceToImage(nn.Module):
     """
     Converts flattened sequence [B, H*W, C] back to image [B, C, H, W] using dynamic seqlens.
@@ -1556,19 +1627,48 @@ class SequenceToImage(nn.Module):
 
     def forward(self, x):
         B, S, D = x.shape
+
+        if self.seqlens is None or len(self.seqlens) == 0:
+            H, W = _infer_square_hw_from_S(int(S))
+            self.seqlens = [H, W]
+
         if len(self.seqlens) == 2:
-            h, w = self.seqlens
-            if S != h * w:
-                raise ValueError(f"Sequence length {S} does not match seqlens {h}*{w}={h*w}")
+            h, w = map(int, self.seqlens)
+            if int(S) != int(h) * int(w):
+                # multi-scale safety: infer square if mismatch
+                h, w = _infer_square_hw_from_S(int(S))
+                self.seqlens = [h, w]
             return x.view(B, h, w, D).permute(0, 3, 1, 2)  # (B, D, H, W) for 2D
+
         elif len(self.seqlens) == 3:
-            d, h, w = self.seqlens
-            if S != d * h * w:
+            d, h, w = map(int, self.seqlens)
+            if int(S) != int(d) * int(h) * int(w):
                 raise ValueError(f"Sequence length {S} does not match seqlens {d}*{h}*{w}={d*h*w}")
             return x.view(B, d, h, w, D).permute(0, 4, 1, 2, 3)  # (B, D, Dep, H, W) for 3D
+
         else:
             raise ValueError(f"Unsupported seqlens dimensions: {len(self.seqlens)}")
-    
+
+
+# class VitPatchEmbedBlock(nn.Module):
+#     """
+#     Wrapper for VitPatchEmbed. Assumes channels-first input (B,C,H,W)
+#     and produces channels-last output (B,H',W',D).
+#     """
+#     def __init__(self, c1, c2, resolution, patch_size, stride=None, init_weights="xavier_uniform"):
+#         super().__init__()
+#         self.module = VitPatchEmbed(
+#             dim=c2,
+#             num_channels=c1,
+#             resolution=resolution,
+#             patch_size=patch_size,
+#             stride=stride,
+#             init_weights=init_weights
+#         )
+
+#     def forward(self, x):
+#         return self.module(x)
+
 class VitPatchEmbedBlock(nn.Module):
     """
     Wrapper for VitPatchEmbed. Assumes channels-first input (B,C,H,W)
@@ -1586,8 +1686,10 @@ class VitPatchEmbedBlock(nn.Module):
         )
 
     def forward(self, x):
+        # x: (B,C,H,W) — update underlying module to current runtime resolution
+        H, W = int(x.shape[2]), int(x.shape[3])
+        _set_seqlens_duck(self.module, (H, W))
         return self.module(x)
-
 
 
 class VitPosEmbedBlock(nn.Module):
@@ -1606,27 +1708,89 @@ class VitPosEmbedBlock(nn.Module):
         )
 
     def forward(self, x):
-        return self.module(x)
+        # x: (B,H,W,D) (NHWC)
+        H, W = int(x.shape[1]), int(x.shape[2])
+
+        # If VitPosEmbed supports forward(x, seqlens=...), use it; else duck-type set
+        try:
+            return self.module(x, seqlens=(H, W))
+        except TypeError:
+            _set_seqlens_duck(self.module, (H, W))
+            return self.module(x)
+
+
+
+# class VitPosEmbedBlock(nn.Module):
+#     """
+#     Wrapper for VitPosEmbed. Takes channels-last (B,H,W,D) and adds
+#     positional embeddings, handling multi-scale inputs via interpolation.
+#     """
+#     def __init__(self, c1, c2, seqlens, is_learnable=True, allow_interpolation=True):
+#         super().__init__()
+#         assert c1 == c2, "Input and output dimensions must match for VitPosEmbedBlock"
+#         self.module = VitPosEmbed(
+#             seqlens=seqlens,
+#             dim=c2,
+#             is_learnable=is_learnable,
+#             allow_interpolation=allow_interpolation
+#         )
+
+#     def forward(self, x):
+#         return self.module(x)
   
+
+
+# class FlattenPosEmbedBlock(nn.Module):
+#     """
+#     A wrapper for VitPosEmbedBlock that re-embeds flattened sequences by reshaping them to their
+#     original grid shape, applying positional embeddings, and flattening them back.
+
+#     Args:
+#         *args: Variable length argument list, typically [c1, c2, seqlens].
+#             - c1 (int): Input dimension (must equal c2).
+#             - c2 (int): Embedding dimension.
+#             - seqlens (list/tuple): Sequence lengths, e.g., [H, W] for 2D or [T, H, W] for 3D.
+#         **kwargs: Additional arguments passed to VitPosEmbedBlock (e.g., is_learnable, allow_interpolation).
+
+#     Input:
+#         x (torch.Tensor): Flattened patch embeddings of shape [B, L, D], where L = H*W (2D) or T*H*W (3D).
+
+#     Output:
+#         torch.Tensor: Flattened embeddings with positional embeddings added, shape [B, L, D].
+#     """
+#     def __init__(self, *args, **kwargs):
+#         super().__init__()
+#         # Parse args similar to VitPosEmbedBlock for YAML compatibility
+#         if len(args) == 1 and isinstance(args[0], (list, tuple)):
+#             args = args[0]
+#         c1, c2, seqlens = args
+#         assert c1 == c2, "Input and output dimensions must be equal"
+#         self.seqlens = seqlens
+#         self.module = VitPosEmbedBlock(*args, **kwargs)
+
+#     def forward(self, x):
+#         # Reshape flattened input [B, L, D] to grid shape based on seqlens
+#         if len(self.seqlens) == 2:  # 2D case: [B, H*W, D] -> [B, H, W, D]
+#             H, W = self.seqlens
+#             x = x.view(-1, H, W, x.shape[-1])
+#         elif len(self.seqlens) == 3:  # 3D case: [B, T*H*W, D] -> [B, T, H, W, D]
+#             T, H, W = self.seqlens
+#             x = x.view(-1, T, H, W, x.shape[-1])
+#         else:
+#             raise ValueError("seqlens must be length 2 or 3")
+        
+#         # Apply positional embeddings using VitPosEmbedBlock
+#         x = self.module(x)
+        
+#         # Flatten back to [B, L, D]
+#         x = x.view(x.shape[0], -1, x.shape[-1])
+#         return x
 
 
 class FlattenPosEmbedBlock(nn.Module):
     """
     A wrapper for VitPosEmbedBlock that re-embeds flattened sequences by reshaping them to their
     original grid shape, applying positional embeddings, and flattening them back.
-
-    Args:
-        *args: Variable length argument list, typically [c1, c2, seqlens].
-            - c1 (int): Input dimension (must equal c2).
-            - c2 (int): Embedding dimension.
-            - seqlens (list/tuple): Sequence lengths, e.g., [H, W] for 2D or [T, H, W] for 3D.
-        **kwargs: Additional arguments passed to VitPosEmbedBlock (e.g., is_learnable, allow_interpolation).
-
-    Input:
-        x (torch.Tensor): Flattened patch embeddings of shape [B, L, D], where L = H*W (2D) or T*H*W (3D).
-
-    Output:
-        torch.Tensor: Flattened embeddings with positional embeddings added, shape [B, L, D].
     """
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -1639,22 +1803,35 @@ class FlattenPosEmbedBlock(nn.Module):
         self.module = VitPosEmbedBlock(*args, **kwargs)
 
     def forward(self, x):
+        # x: [B, L, D]
+        B, L, D = x.shape
+
+        # Repair/infer seqlens for multi-scale square case when mismatch
+        if self.seqlens is None or len(self.seqlens) == 0:
+            H, W = _infer_square_hw_from_S(int(L))
+            self.seqlens = [H, W]
+        elif len(self.seqlens) == 2:
+            H, W = map(int, self.seqlens)
+            if int(H) * int(W) != int(L):
+                H, W = _infer_square_hw_from_S(int(L))
+                self.seqlens = [H, W]
+
         # Reshape flattened input [B, L, D] to grid shape based on seqlens
-        if len(self.seqlens) == 2:  # 2D case: [B, H*W, D] -> [B, H, W, D]
-            H, W = self.seqlens
-            x = x.view(-1, H, W, x.shape[-1])
-        elif len(self.seqlens) == 3:  # 3D case: [B, T*H*W, D] -> [B, T, H, W, D]
-            T, H, W = self.seqlens
-            x = x.view(-1, T, H, W, x.shape[-1])
+        if len(self.seqlens) == 2:  # 2D case
+            H, W = map(int, self.seqlens)
+            xg = x.view(B, H, W, D)
+        elif len(self.seqlens) == 3:  # 3D case
+            T, H, W = map(int, self.seqlens)
+            xg = x.view(B, T, H, W, D)
         else:
             raise ValueError("seqlens must be length 2 or 3")
-        
-        # Apply positional embeddings using VitPosEmbedBlock
-        x = self.module(x)
-        
+
+        # Apply positional embeddings using VitPosEmbedBlock (ensure correct runtime H,W)
+        xg = self.module(xg)
+
         # Flatten back to [B, L, D]
-        x = x.view(x.shape[0], -1, x.shape[-1])
-        return x
+        return xg.view(B, -1, xg.shape[-1])
+
 
 
 
@@ -1900,73 +2077,181 @@ class PatchMerging(nn.Module):
 
         return x
 
+# class SwinPatchMergeBlock(nn.Module):
+#     """
+#     Streamlined Patch Merging Layer (replaces SwinPatchMergeBlock).
+#     Reduces token count by 4x and increases feature dimension by 2x.
+#     - Input: (B, H, W, C)
+#     - Output: (B, H/2, W/2, 2*C)
+#     """
+#     def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
+#         super().__init__()
+#         self.in_dim = c1
+#         self.out_dim = c2
+#         #assert c2 == 2 * c1, "PatchMergeBlock expects output dim to be 2x input dim."
+
+#         self.norm = norm_layer(4 * self.in_dim)
+#         self.reduction = nn.Linear(4 * self.in_dim, self.out_dim, bias=False)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             x (torch.Tensor): Input tensor of shape (B, H, W, C).
+#         """
+#         assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
+#         B, H, W, C = x.shape
+#         #assert C == self.in_dim, f"Input channels {C} mismatch expected {self.in_dim}"
+#         #assert H % 2 == 0 and W % 2 == 0, f"H ({H}) and W ({W}) must be even."
+
+#         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+#         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+#         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+#         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+#         cat_x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+
+#         merged_x = self.norm(cat_x)
+#         merged_x = self.reduction(merged_x)
+#         return merged_x
+
+
 class SwinPatchMergeBlock(nn.Module):
-    """
-    Streamlined Patch Merging Layer (replaces SwinPatchMergeBlock).
-    Reduces token count by 4x and increases feature dimension by 2x.
-    - Input: (B, H, W, C)
-    - Output: (B, H/2, W/2, 2*C)
-    """
-    def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
+    def __init__(self, in_dim, out_dim, norm_layer=nn.RMSNorm):
         super().__init__()
-        self.in_dim = c1
-        self.out_dim = c2
-        #assert c2 == 2 * c1, "PatchMergeBlock expects output dim to be 2x input dim."
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.reduction = nn.Linear(4 * in_dim, out_dim, bias=False)
+        self.norm = norm_layer(4 * in_dim)
 
-        self.norm = norm_layer(4 * self.in_dim)
-        self.reduction = nn.Linear(4 * self.in_dim, self.out_dim, bias=False)
+    def forward(self, x):
+        # FIX: Ensure last dim is NOT in_dim before assuming BCHW.
+        # This prevents permuting (B, H, W, C) when H == C.
+        bchw = (x.ndim == 4 and x.shape[1] == self.in_dim and x.shape[-1] != self.in_dim)
+        
+        if bchw:
+            x = x.permute(0, 2, 3, 1).contiguous()  # BCHW -> BHWC
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, H, W, C).
-        """
-        assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
         B, H, W, C = x.shape
-        #assert C == self.in_dim, f"Input channels {C} mismatch expected {self.in_dim}"
-        #assert H % 2 == 0 and W % 2 == 0, f"H ({H}) and W ({W}) must be even."
+        
+        # Pad if H or W is odd
+        if (H % 2 == 1) or (W % 2 == 1):
+            pad_h = 0 if H % 2 == 0 else 1
+            pad_w = 0 if W % 2 == 0 else 1
+            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+            H, W = x.shape[1], x.shape[2]
 
-        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
-        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
-        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
-        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        cat_x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        # Patch merging logic
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], dim=-1)  # (B, H/2, W/2, 4*C)
 
-        merged_x = self.norm(cat_x)
-        merged_x = self.reduction(merged_x)
-        return merged_x
+        x = self.norm(x)
+        x = self.reduction(x)  # (B, H/2, W/2, out_dim)
+
+        if bchw:
+            x = x.permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
+            
+        return x
 
 
+# class SwinPatchExpandBlock(nn.Module):
+#     def __init__(self, in_dim, out_dim, norm_layer=nn.RMSNorm):
+#         super().__init__()
+#         self.in_dim = in_dim
+#         self.out_dim = out_dim
+#         # IMPORTANT: project to 4*out_dim (not 4*in_dim)
+#         self.expand = nn.Linear(in_dim, 4 * out_dim, bias=False)
+#         self.norm = norm_layer(out_dim)
+
+#     def forward(self, x):
+#         # Accept both BCHW (YOLO) and BHWC (Swin-style)
+#         bchw = (x.ndim == 4 and x.shape[1] == self.in_dim)  # likely BCHW if channel matches
+#         if bchw:
+#             x = x.permute(0, 2, 3, 1).contiguous()  # BCHW -> BHWC
+
+#         B, H, W, C = x.shape
+#         # C should be in_dim now
+#         x_expanded = self.expand(x)  # (B, H, W, 4*out_dim)
+
+#         x = einops.rearrange(
+#             x_expanded,
+#             "b h w (p1 p2 c) -> b (h p1) (w p2) c",
+#             p1=2, p2=2, c=self.out_dim
+#         )  # (B, 2H, 2W, out_dim)
+
+#         x = self.norm(x)
+
+#         if bchw:
+#             x = x.permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
+#         return x
 
 
 class SwinPatchExpandBlock(nn.Module):
-    """
-    Streamlined Patch Expansion Layer (replaces SwinPatchExpandBlock).
-    Increases token count by 4x and reduces feature dimension by 2x.
-    - Input: (B, H, W, C)
-    - Output: (B, 2*H, 2*W, C/2)
-    """
-    def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
+    def __init__(self, in_dim, out_dim, norm_layer=nn.RMSNorm):
         super().__init__()
-        self.in_dim = c1
-        self.out_dim = c2
-        #assert c1 == 2 * c2, "PatchExpandBlock expects input dim to be 2x output dim."
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        # Project to 4*out_dim (upscaling)
+        self.expand = nn.Linear(in_dim, 4 * out_dim, bias=False)
+        self.norm = norm_layer(out_dim)
 
-        self.expand = nn.Linear(self.in_dim, 4 * self.in_dim, bias=False)
-        self.norm = norm_layer(self.out_dim)
+    def forward(self, x):
+        # FIX: Ensure last dim is NOT in_dim before assuming BCHW.
+        # This prevents permuting (B, H, W, C) when H == C.
+        bchw = (x.ndim == 4 and x.shape[1] == self.in_dim and x.shape[-1] != self.in_dim)
+        
+        if bchw:
+            x = x.permute(0, 2, 3, 1).contiguous()  # BCHW -> BHWC
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, H, W, C).
-        """
-        #assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
-        x_expanded = self.expand(x)
-        B, H, W, C_exp = x_expanded.shape
+        B, H, W, C = x.shape
+        
+        x_expanded = self.expand(x)  # (B, H, W, 4*out_dim)
 
-        x_rearranged = einops.rearrange(x_expanded, 'b h w (p1 p2 c) -> b (h p1) (w p2) c', p1=2, p2=2)
-        x_out = self.norm(x_rearranged)
-        return x_out
+        # Rearrange to upscale resolution: (H, W) -> (2H, 2W)
+        x = einops.rearrange(
+            x_expanded,
+            "b h w (p1 p2 c) -> b (h p1) (w p2) c",
+            p1=2, p2=2, c=self.out_dim
+        )  # (B, 2H, 2W, out_dim)
+
+        x = self.norm(x)
+
+        if bchw:
+            x = x.permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
+            
+        return x
+
+
+
+# class SwinPatchExpandBlock(nn.Module):
+#     """
+#     Streamlined Patch Expansion Layer (replaces SwinPatchExpandBlock).
+#     Increases token count by 4x and reduces feature dimension by 2x.
+#     - Input: (B, H, W, C)
+#     - Output: (B, 2*H, 2*W, C/2)
+#     """
+#     def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
+#         super().__init__()
+#         self.in_dim = c1
+#         self.out_dim = c2
+#         #assert c1 == 2 * c2, "PatchExpandBlock expects input dim to be 2x output dim."
+
+#         self.expand = nn.Linear(self.in_dim, 4 * self.in_dim, bias=False)
+#         self.norm = norm_layer(self.out_dim)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             x (torch.Tensor): Input tensor of shape (B, H, W, C).
+#         """
+#         #assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
+#         x_expanded = self.expand(x)
+#         B, H, W, C_exp = x_expanded.shape
+
+#         x_rearranged = einops.rearrange(x_expanded, 'b h w (p1 p2 c) -> b (h p1) (w p2) c', p1=2, p2=2)
+#         x_out = self.norm(x_rearranged)
+#         return x_out
     
 class PatchExpand(nn.Module):
     def __init__(self, dim):
@@ -2266,7 +2551,7 @@ class ViLFusionBlock(nn.Module):
 class ViLBlockPairBlock(nn.Module):
     """
     NHWC wrapper around ViLBlockPair so it can slot into channels-last pipelines.
-    Accepts and returns (B, H, W, C). Supports in/out dim mismatch with 1x1 linear.
+    Accepts and returns (B, H, W, C). Also tolerates BCHW input and returns BCHW in that case.
     """
     def __init__(self, in_dim: int, out_dim: int, config: Optional[dict] = None):
         super().__init__()
@@ -2275,20 +2560,97 @@ class ViLBlockPairBlock(nn.Module):
         drop_path = float(cfg.pop("drop_path", 0.0))
         conv_kernel_size = int(cfg.pop("conv_kernel_size", 3))
 
-        # Core pair
         self.core = ViLBlockPair(dim=out_dim, drop_path=drop_path,
                                  conv_kernel_size=conv_kernel_size, **cfg)
 
-        # Channel adapters (operate on NHWC)
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
         self.in_adapt = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
-        self.out_adapt = nn.Identity()  # keep NHWC out_dim
+        self.out_adapt = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, H, W, C_in)
-        b, h, w, c = x.shape
-        x = self.in_adapt(x)
-        x = self.core(x)     # (B, H*W, C_out)
+        # Accept both BCHW and BHWC
+        bchw = (x.ndim == 4 and x.shape[1] == self.in_dim and x.shape[-1] != self.in_dim)
+
+        if bchw:
+            # BCHW -> BHWC
+            b, _, h, w = x.shape
+            x = x.permute(0, 2, 3, 1).contiguous()
+        else:
+            # BHWC
+            b, h, w, _ = x.shape
+
+        x = self.in_adapt(x)          # (B,H,W,C_out)
+        x = self.core(x)              # (B,H*W,C_out)
+        x = x.reshape(b, h, w, -1)    # (B,H,W,C_out)
+        x = self.out_adapt(x)
+
+        if bchw:
+            # BHWC -> BCHW
+            x = x.permute(0, 3, 1, 2).contiguous()
+
         return x
+
+
+# class ViLBlockPairBlock(nn.Module):
+#     """
+#     NHWC wrapper around ViLBlockPair so it can slot into channels-last pipelines.
+#     Accepts and returns (B, H, W, C). Supports in/out dim mismatch with 1x1 linear.
+#     """
+#     def __init__(self, in_dim: int, out_dim: int, config: Optional[dict] = None):
+#         super().__init__()
+#         cfg = {} if config is None else dict(config)
+#         cfg.pop("seqlens", None)
+#         drop_path = float(cfg.pop("drop_path", 0.0))
+#         conv_kernel_size = int(cfg.pop("conv_kernel_size", 3))
+
+#         self.core = ViLBlockPair(dim=out_dim, drop_path=drop_path,
+#                                  conv_kernel_size=conv_kernel_size, **cfg)
+
+#         self.in_adapt = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+#         self.out_adapt = nn.Identity()
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         # x: (B, H, W, C_in)
+#         b, h, w, _ = x.shape
+#         x = self.in_adapt(x)          # (B,H,W,C_out)
+
+#         x = self.core(x)              # (B, H*W, C_out)
+
+#         # **CRITICAL**: restore NHWC to keep the pipeline consistent
+#         x = x.reshape(b, h, w, -1)    # (B,H,W,C_out)
+
+#         return self.out_adapt(x)
+
+
+
+# class ViLBlockPairBlock(nn.Module):
+#     """
+#     NHWC wrapper around ViLBlockPair so it can slot into channels-last pipelines.
+#     Accepts and returns (B, H, W, C). Supports in/out dim mismatch with 1x1 linear.
+#     """
+#     def __init__(self, in_dim: int, out_dim: int, config: Optional[dict] = None):
+#         super().__init__()
+#         cfg = {} if config is None else dict(config)
+#         cfg.pop("seqlens", None)
+#         drop_path = float(cfg.pop("drop_path", 0.0))
+#         conv_kernel_size = int(cfg.pop("conv_kernel_size", 3))
+
+#         # Core pair
+#         self.core = ViLBlockPair(dim=out_dim, drop_path=drop_path,
+#                                  conv_kernel_size=conv_kernel_size, **cfg)
+
+#         # Channel adapters (operate on NHWC)
+#         self.in_adapt = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+#         self.out_adapt = nn.Identity()  # keep NHWC out_dim
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         # x: (B, H, W, C_in)
+#         b, h, w, c = x.shape
+#         x = self.in_adapt(x)
+#         x = self.core(x)     # (B, H*W, C_out)
+#         return x
 
 class WindowedViLFusionBlock(nn.Module):
     """

@@ -1454,7 +1454,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             # Concatenation sums channels from specified layers
             c2 = sum(ch[x] for x in f)
 
-        elif m is Detect:
+        elif m is Detect or v10Detect:
             # Detect head takes a list of input channels
             args.append([ch[x] for x in f])
         
