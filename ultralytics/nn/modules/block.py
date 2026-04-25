@@ -9,13 +9,9 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
-from .vision_lstm.vision_lstm2 import VitPatchEmbed, VitPosEmbed2d, ViLBlockPair, SequenceConv2d, LayerNorm, MultiHeadLayerNorm, MultiHeadRMSNorm
+from .vision_lstm.vision_lstm2 import VitPatchEmbed, VitPosEmbed2d, ViLBlockPair, SequenceConv2d, LayerNorm, MultiHeadLayerNorm
 from .vision_lstm.vision_lstm_hierarchical import PatchMerge, MultiScaleFusion
-from .vision_lstm.vision_lstm_util import VitPosEmbed, DropPath  # Adjust import path as needed
-  # run once, before Ultralytics builds the optimiser
-
-
-# Import from vision_lstm.py (assuming it's in the same directory or a submodule)
+from .vision_lstm.vision_lstm_util import VitPosEmbed, DropPath
 
 __all__ = (
     "DFL",
@@ -61,18 +57,58 @@ __all__ = (
     "VisionLSTMTorch",
     "FeatureSplitIndex",
     "VitPatchEmbedBlock",
-    "VitPosEmbed2dBlock",
+    "VitPosEmbedBlock",
     "ViLBlockPairBlock",
     "PatchMergeBlock",
-    "ViLFusionBlock"
+    "ViLFusionBlock",
     "ViLLayerNormBlock",
     "PatchMerger",
     "PermuteBlock",
     "FlattenPosEmbedBlock",
     "PatchMerging",
+    "SwinPatchMergeBlock",
+    "SwinPatchExpandBlock",
 )
 
 import math
+
+def _normalize_layout(layout: str, owner: str) -> str:
+    layout = str(layout).lower()
+    if layout not in {"nhwc", "bchw"}:
+        raise ValueError(f"{owner} layout must be 'nhwc' or 'bchw', got {layout!r}")
+    return layout
+
+
+def _infer_4d_layout(x: torch.Tensor, channels: int, owner: str) -> str:
+    if x.ndim != 4:
+        raise ValueError(f"{owner} expects a 4D tensor, got shape {tuple(x.shape)}")
+
+    channels = int(channels)
+    looks_bchw = x.shape[1] == channels
+    looks_nhwc = x.shape[-1] == channels
+
+    if looks_bchw and looks_nhwc:
+        raise ValueError(
+            f"{owner} cannot infer layout for shape {tuple(x.shape)} with {channels} channels; "
+            "pass an unambiguous BCHW or NHWC tensor"
+        )
+    if looks_bchw:
+        return "bchw"
+    if looks_nhwc:
+        return "nhwc"
+    raise ValueError(
+        f"{owner} expected {channels} channels in dim 1 (BCHW) or dim -1 (NHWC), "
+        f"got shape {tuple(x.shape)}"
+    )
+
+
+def _to_nhwc(x: torch.Tensor, layout: str) -> torch.Tensor:
+    return x.permute(0, 2, 3, 1).contiguous() if layout == "bchw" else x
+
+
+def _from_nhwc(x: torch.Tensor, layout: str) -> torch.Tensor:
+    return x.permute(0, 3, 1, 2).contiguous() if layout == "bchw" else x
+
 
 def propagate_seqlens(root: torch.nn.Module, hw: tuple[int, int]):
     """Set .seqlens on every submodule that exposes it (duck-typed)."""
@@ -1650,32 +1686,16 @@ class SequenceToImage(nn.Module):
             raise ValueError(f"Unsupported seqlens dimensions: {len(self.seqlens)}")
 
 
-# class VitPatchEmbedBlock(nn.Module):
-#     """
-#     Wrapper for VitPatchEmbed. Assumes channels-first input (B,C,H,W)
-#     and produces channels-last output (B,H',W',D).
-#     """
-#     def __init__(self, c1, c2, resolution, patch_size, stride=None, init_weights="xavier_uniform"):
-#         super().__init__()
-#         self.module = VitPatchEmbed(
-#             dim=c2,
-#             num_channels=c1,
-#             resolution=resolution,
-#             patch_size=patch_size,
-#             stride=stride,
-#             init_weights=init_weights
-#         )
-
-#     def forward(self, x):
-#         return self.module(x)
-
 class VitPatchEmbedBlock(nn.Module):
     """
     Wrapper for VitPatchEmbed. Assumes channels-first input (B,C,H,W)
-    and produces channels-last output (B,H',W',D).
+    and produces channels-last output by default. Set out_layout="bchw"
+    to keep the YAML graph channels-first.
     """
-    def __init__(self, c1, c2, resolution, patch_size, stride=None, init_weights="xavier_uniform"):
+    def __init__(self, c1, c2, resolution, patch_size, stride=None, init_weights="xavier_uniform", out_layout="nhwc"):
         super().__init__()
+        self.in_channels = int(c1)
+        self.out_layout = _normalize_layout(out_layout, self.__class__.__name__)
         self.module = VitPatchEmbed(
             dim=c2,
             num_channels=c1,
@@ -1686,20 +1706,28 @@ class VitPatchEmbedBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B,C,H,W) — update underlying module to current runtime resolution
+        # Update the underlying patch embedder to the current BCHW image size.
+        if x.ndim != 4 or x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"{self.__class__.__name__} expects BCHW input with {self.in_channels} channels, "
+                f"got shape {tuple(x.shape)}"
+            )
         H, W = int(x.shape[2]), int(x.shape[3])
         _set_seqlens_duck(self.module, (H, W))
-        return self.module(x)
+        x = self.module(x)
+        return _from_nhwc(x, self.out_layout)
 
 
 class VitPosEmbedBlock(nn.Module):
     """
-    Wrapper for VitPosEmbed. Takes channels-last (B,H,W,D) and adds
-    positional embeddings, handling multi-scale inputs via interpolation.
+    Wrapper for VitPosEmbed. Takes channels-last (B,H,W,D) by default
+    and adds positional embeddings, handling multi-scale inputs via interpolation.
+    Set layout="bchw" to keep the YAML graph channels-first.
     """
-    def __init__(self, c1, c2, seqlens, is_learnable=True, allow_interpolation=True):
+    def __init__(self, c1, c2, seqlens, is_learnable=True, allow_interpolation=True, layout="nhwc"):
         super().__init__()
         assert c1 == c2, "Input and output dimensions must match for VitPosEmbedBlock"
+        self.layout = _normalize_layout(layout, self.__class__.__name__)
         self.module = VitPosEmbed(
             seqlens=seqlens,
             dim=c2,
@@ -1708,36 +1736,26 @@ class VitPosEmbedBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B,H,W,D) (NHWC)
-        H, W = int(x.shape[1]), int(x.shape[2])
+        input_layout = _infer_4d_layout(x, self.module.embed.shape[-1], self.__class__.__name__)
+        if input_layout != self.layout:
+            raise ValueError(
+                f"{self.__class__.__name__} was configured for {self.layout.upper()} input, "
+                f"but received {input_layout.upper()} shape {tuple(x.shape)}"
+            )
+        if self.layout == "bchw":
+            H, W = int(x.shape[2]), int(x.shape[3])
+        else:
+            H, W = int(x.shape[1]), int(x.shape[2])
+        x = _to_nhwc(x, self.layout)
 
         # If VitPosEmbed supports forward(x, seqlens=...), use it; else duck-type set
         try:
-            return self.module(x, seqlens=(H, W))
+            x = self.module(x, seqlens=(H, W))
         except TypeError:
             _set_seqlens_duck(self.module, (H, W))
-            return self.module(x)
+            x = self.module(x)
+        return _from_nhwc(x, self.layout)
 
-
-
-# class VitPosEmbedBlock(nn.Module):
-#     """
-#     Wrapper for VitPosEmbed. Takes channels-last (B,H,W,D) and adds
-#     positional embeddings, handling multi-scale inputs via interpolation.
-#     """
-#     def __init__(self, c1, c2, seqlens, is_learnable=True, allow_interpolation=True):
-#         super().__init__()
-#         assert c1 == c2, "Input and output dimensions must match for VitPosEmbedBlock"
-#         self.module = VitPosEmbed(
-#             seqlens=seqlens,
-#             dim=c2,
-#             is_learnable=is_learnable,
-#             allow_interpolation=allow_interpolation
-#         )
-
-#     def forward(self, x):
-#         return self.module(x)
-  
 
 
 # class FlattenPosEmbedBlock(nn.Module):
@@ -2077,45 +2095,10 @@ class PatchMerging(nn.Module):
 
         return x
 
-# class SwinPatchMergeBlock(nn.Module):
-#     """
-#     Streamlined Patch Merging Layer (replaces SwinPatchMergeBlock).
-#     Reduces token count by 4x and increases feature dimension by 2x.
-#     - Input: (B, H, W, C)
-#     - Output: (B, H/2, W/2, 2*C)
-#     """
-#     def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
-#         super().__init__()
-#         self.in_dim = c1
-#         self.out_dim = c2
-#         #assert c2 == 2 * c1, "PatchMergeBlock expects output dim to be 2x input dim."
-
-#         self.norm = norm_layer(4 * self.in_dim)
-#         self.reduction = nn.Linear(4 * self.in_dim, self.out_dim, bias=False)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Args:
-#             x (torch.Tensor): Input tensor of shape (B, H, W, C).
-#         """
-#         assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
-#         B, H, W, C = x.shape
-#         #assert C == self.in_dim, f"Input channels {C} mismatch expected {self.in_dim}"
-#         #assert H % 2 == 0 and W % 2 == 0, f"H ({H}) and W ({W}) must be even."
-
-#         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
-#         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
-#         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
-#         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-#         cat_x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-
-#         merged_x = self.norm(cat_x)
-#         merged_x = self.reduction(merged_x)
-#         return merged_x
-
-
 class SwinPatchMergeBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, norm_layer=nn.RMSNorm):
+    """Swin-style 2x patch merge. Accepts NHWC and preserves BCHW inputs when supplied."""
+
+    def __init__(self, in_dim, out_dim, norm_layer=LayerNorm):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -2123,12 +2106,10 @@ class SwinPatchMergeBlock(nn.Module):
         self.norm = norm_layer(4 * in_dim)
 
     def forward(self, x):
-        # FIX: Ensure last dim is NOT in_dim before assuming BCHW.
-        # This prevents permuting (B, H, W, C) when H == C.
-        bchw = (x.ndim == 4 and x.shape[1] == self.in_dim and x.shape[-1] != self.in_dim)
+        input_layout = _infer_4d_layout(x, self.in_dim, self.__class__.__name__)
         
-        if bchw:
-            x = x.permute(0, 2, 3, 1).contiguous()  # BCHW -> BHWC
+        if input_layout == "bchw":
+            x = _to_nhwc(x, input_layout)
 
         B, H, W, C = x.shape
         
@@ -2149,60 +2130,25 @@ class SwinPatchMergeBlock(nn.Module):
         x = self.norm(x)
         x = self.reduction(x)  # (B, H/2, W/2, out_dim)
 
-        if bchw:
-            x = x.permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
-            
-        return x
-
-
-# class SwinPatchExpandBlock(nn.Module):
-#     def __init__(self, in_dim, out_dim, norm_layer=nn.RMSNorm):
-#         super().__init__()
-#         self.in_dim = in_dim
-#         self.out_dim = out_dim
-#         # IMPORTANT: project to 4*out_dim (not 4*in_dim)
-#         self.expand = nn.Linear(in_dim, 4 * out_dim, bias=False)
-#         self.norm = norm_layer(out_dim)
-
-#     def forward(self, x):
-#         # Accept both BCHW (YOLO) and BHWC (Swin-style)
-#         bchw = (x.ndim == 4 and x.shape[1] == self.in_dim)  # likely BCHW if channel matches
-#         if bchw:
-#             x = x.permute(0, 2, 3, 1).contiguous()  # BCHW -> BHWC
-
-#         B, H, W, C = x.shape
-#         # C should be in_dim now
-#         x_expanded = self.expand(x)  # (B, H, W, 4*out_dim)
-
-#         x = einops.rearrange(
-#             x_expanded,
-#             "b h w (p1 p2 c) -> b (h p1) (w p2) c",
-#             p1=2, p2=2, c=self.out_dim
-#         )  # (B, 2H, 2W, out_dim)
-
-#         x = self.norm(x)
-
-#         if bchw:
-#             x = x.permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
-#         return x
+        return _from_nhwc(x, input_layout)
 
 
 class SwinPatchExpandBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, norm_layer=nn.RMSNorm):
+    """Swin-style 2x patch expansion. Accepts NHWC and preserves BCHW inputs when supplied."""
+
+    def __init__(self, in_dim, out_dim, norm_layer=LayerNorm):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
-        # Project to 4*out_dim (upscaling)
+        # Project to 4 * out_dim for 2x spatial upsampling.
         self.expand = nn.Linear(in_dim, 4 * out_dim, bias=False)
         self.norm = norm_layer(out_dim)
 
     def forward(self, x):
-        # FIX: Ensure last dim is NOT in_dim before assuming BCHW.
-        # This prevents permuting (B, H, W, C) when H == C.
-        bchw = (x.ndim == 4 and x.shape[1] == self.in_dim and x.shape[-1] != self.in_dim)
+        input_layout = _infer_4d_layout(x, self.in_dim, self.__class__.__name__)
         
-        if bchw:
-            x = x.permute(0, 2, 3, 1).contiguous()  # BCHW -> BHWC
+        if input_layout == "bchw":
+            x = _to_nhwc(x, input_layout)
 
         B, H, W, C = x.shape
         
@@ -2217,42 +2163,8 @@ class SwinPatchExpandBlock(nn.Module):
 
         x = self.norm(x)
 
-        if bchw:
-            x = x.permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
-            
-        return x
+        return _from_nhwc(x, input_layout)
 
-
-
-# class SwinPatchExpandBlock(nn.Module):
-#     """
-#     Streamlined Patch Expansion Layer (replaces SwinPatchExpandBlock).
-#     Increases token count by 4x and reduces feature dimension by 2x.
-#     - Input: (B, H, W, C)
-#     - Output: (B, 2*H, 2*W, C/2)
-#     """
-#     def __init__(self, c1: int, c2: int, norm_layer=nn.RMSNorm):
-#         super().__init__()
-#         self.in_dim = c1
-#         self.out_dim = c2
-#         #assert c1 == 2 * c2, "PatchExpandBlock expects input dim to be 2x output dim."
-
-#         self.expand = nn.Linear(self.in_dim, 4 * self.in_dim, bias=False)
-#         self.norm = norm_layer(self.out_dim)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Args:
-#             x (torch.Tensor): Input tensor of shape (B, H, W, C).
-#         """
-#         #assert x.ndim == 4, "Input must be a 4D tensor (B, H, W, C)"
-#         x_expanded = self.expand(x)
-#         B, H, W, C_exp = x_expanded.shape
-
-#         x_rearranged = einops.rearrange(x_expanded, 'b h w (p1 p2 c) -> b (h p1) (w p2) c', p1=2, p2=2)
-#         x_out = self.norm(x_rearranged)
-#         return x_out
-    
 class PatchExpand(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -2423,7 +2335,7 @@ class SimpleStem(nn.Module):
 
 class LSBlock(nn.Module):
     """
-    Lightweight spatial mixing block with depthwise conv → norm → pointwise convs.
+    Lightweight spatial mixing block with depthwise conv, norm, and pointwise convs.
     Kernel size is configurable.
     """
     def __init__(self, in_features, hidden_features=None, act_layer=nn.GELU, drop=0.0, kernel_size: int = 3):
@@ -2432,7 +2344,7 @@ class LSBlock(nn.Module):
         pad = kernel_size // 2
         self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=kernel_size,
                              padding=pad, groups=hidden_features)
-        self.norm = RMSNorm2d(num_channels=hidden_features)
+        self.norm = LayerNorm2d(num_channels=hidden_features)
         self.fc2 = nn.Conv2d(hidden_features, hidden_features, kernel_size=1, padding=0)
         self.act = act_layer()
         self.fc3 = nn.Conv2d(hidden_features, in_features, kernel_size=1, padding=0)
@@ -2452,7 +2364,7 @@ class LSBlock(nn.Module):
 class RGBlock(nn.Module):
     """
     Convolutional MLP (RegLU/GELU-friendly) with optional depthwise spatial kernel.
-    Shape-preserving: (B, C, H, W) → (B, C, H, W).
+    Shape-preserving: (B, C, H, W) -> (B, C, H, W).
     """
     def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3,
                  drop: float = 0.0, act_layer=nn.GELU):
@@ -2475,26 +2387,22 @@ class RGBlock(nn.Module):
         return x
 
 
-class RMSNorm2d(nn.Module):
-    """A wrapper for the native RMSNorm to work on 2D channels-first data."""
-    def __init__(self, num_channels: int, eps: float = 1e-6):
+class LayerNorm2d(nn.Module):
+    """VisionLSTM LayerNorm wrapper for 2D channels-first data."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6, bias: bool = True):
         super().__init__()
-        # elementwise_affine=True creates the learnable 'weight' parameter
-        self.norm = nn.RMSNorm(num_channels, eps=eps, elementwise_affine=True)
+        self.norm = LayerNorm(ndim=num_channels, weight=True, bias=bias, eps=eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): Input tensor of shape (B, C, H, W).
         """
-        # 1. Permute from (B, C, H, W) to (B, H, W, C)
+        # VisionLSTM LayerNorm operates on the last dimension.
         x_permuted = x.permute(0, 2, 3, 1)
-        
-        # 2. Apply the native RMSNorm
         x_normed = self.norm(x_permuted)
-        
-        # 3. Permute back to (B, C, H, W)
-        return x_normed.permute(0, 3, 1, 2)
+        return x_normed.permute(0, 3, 1, 2).contiguous()
 
     
 
@@ -2512,19 +2420,19 @@ class ViLFusionBlock(nn.Module):
         cfg.pop("seqlens", None)
         ls_k = int(cfg.pop("ls_kernel_size", 3))
         rg_k = int(cfg.pop("rg_kernel_size", 3))
-        # mlp_ratio = float(cfg.pop("mlp_ratio", 4.0))
+        mlp_ratio = float(cfg.pop("mlp_ratio", mlp_ratio))
 
         hidden_dim = c2
 
         self.in_proj = (nn.Sequential(
             nn.Conv2d(c1, hidden_dim, kernel_size=1, bias=False),
-            RMSNorm2d(num_channels=hidden_dim),
+            LayerNorm2d(num_channels=hidden_dim),
             nn.SiLU()
         ) if c1 != hidden_dim else nn.Identity())
 
         self.lsblock = LSBlock(hidden_dim, hidden_dim, kernel_size=ls_k)
 
-        # n× ViLBlockPairBlock on NHWC
+        # Run n ViL block pairs on NHWC features.
         self.vil = nn.Sequential(*[
             ViLBlockPairBlock(hidden_dim, hidden_dim, cfg) for _ in range(int(n))
         ])
@@ -2570,87 +2478,20 @@ class ViLBlockPairBlock(nn.Module):
         self.out_adapt = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept both BCHW and BHWC
-        bchw = (x.ndim == 4 and x.shape[1] == self.in_dim and x.shape[-1] != self.in_dim)
-
-        if bchw:
-            # BCHW -> BHWC
+        input_layout = _infer_4d_layout(x, self.in_dim, self.__class__.__name__)
+        if input_layout == "bchw":
             b, _, h, w = x.shape
-            x = x.permute(0, 2, 3, 1).contiguous()
         else:
-            # BHWC
             b, h, w, _ = x.shape
+        x = _to_nhwc(x, input_layout)
 
         x = self.in_adapt(x)          # (B,H,W,C_out)
         x = self.core(x)              # (B,H*W,C_out)
         x = x.reshape(b, h, w, -1)    # (B,H,W,C_out)
         x = self.out_adapt(x)
 
-        if bchw:
-            # BHWC -> BCHW
-            x = x.permute(0, 3, 1, 2).contiguous()
+        return _from_nhwc(x, input_layout)
 
-        return x
-
-
-# class ViLBlockPairBlock(nn.Module):
-#     """
-#     NHWC wrapper around ViLBlockPair so it can slot into channels-last pipelines.
-#     Accepts and returns (B, H, W, C). Supports in/out dim mismatch with 1x1 linear.
-#     """
-#     def __init__(self, in_dim: int, out_dim: int, config: Optional[dict] = None):
-#         super().__init__()
-#         cfg = {} if config is None else dict(config)
-#         cfg.pop("seqlens", None)
-#         drop_path = float(cfg.pop("drop_path", 0.0))
-#         conv_kernel_size = int(cfg.pop("conv_kernel_size", 3))
-
-#         self.core = ViLBlockPair(dim=out_dim, drop_path=drop_path,
-#                                  conv_kernel_size=conv_kernel_size, **cfg)
-
-#         self.in_adapt = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
-#         self.out_adapt = nn.Identity()
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         # x: (B, H, W, C_in)
-#         b, h, w, _ = x.shape
-#         x = self.in_adapt(x)          # (B,H,W,C_out)
-
-#         x = self.core(x)              # (B, H*W, C_out)
-
-#         # **CRITICAL**: restore NHWC to keep the pipeline consistent
-#         x = x.reshape(b, h, w, -1)    # (B,H,W,C_out)
-
-#         return self.out_adapt(x)
-
-
-
-# class ViLBlockPairBlock(nn.Module):
-#     """
-#     NHWC wrapper around ViLBlockPair so it can slot into channels-last pipelines.
-#     Accepts and returns (B, H, W, C). Supports in/out dim mismatch with 1x1 linear.
-#     """
-#     def __init__(self, in_dim: int, out_dim: int, config: Optional[dict] = None):
-#         super().__init__()
-#         cfg = {} if config is None else dict(config)
-#         cfg.pop("seqlens", None)
-#         drop_path = float(cfg.pop("drop_path", 0.0))
-#         conv_kernel_size = int(cfg.pop("conv_kernel_size", 3))
-
-#         # Core pair
-#         self.core = ViLBlockPair(dim=out_dim, drop_path=drop_path,
-#                                  conv_kernel_size=conv_kernel_size, **cfg)
-
-#         # Channel adapters (operate on NHWC)
-#         self.in_adapt = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
-#         self.out_adapt = nn.Identity()  # keep NHWC out_dim
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         # x: (B, H, W, C_in)
-#         b, h, w, c = x.shape
-#         x = self.in_adapt(x)
-#         x = self.core(x)     # (B, H*W, C_out)
-#         return x
 
 class WindowedViLFusionBlock(nn.Module):
     """
@@ -2756,4 +2597,3 @@ class PermuteBlock(nn.Module):
 nn.ViLLayerNormBlock = ViLLayerNormBlock
 nn.ViLInternalNorm = LayerNorm 
 nn.ViLInternalMultiHeadNorm = MultiHeadLayerNorm 
-nn.MultiHeadRMSNorm = MultiHeadRMSNorm

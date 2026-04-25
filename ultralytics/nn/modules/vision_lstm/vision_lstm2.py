@@ -355,8 +355,8 @@ class MatrixLSTMCell(nn.Module):
         # Fused ifgate projection: produces [i, f] for each head
         self.ifgate = nn.Linear(3 * dim, 2 * num_heads)
 
-        # Normalization across heads (group-norm based LN)
-        self.outnorm = MultiHeadRMSNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
+        # Original VisionLSTM pattern: normalize across heads with LayerNorm semantics.
+        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
 
         # Backend configs (CPU/GPU, train/infer)
         self.cpu_backend_config_infer = mLSTMBackendConfig(
@@ -1177,29 +1177,32 @@ class ViLLayer(nn.Module):
         self.sd_depth_scale = max(0.0, min(1.0, float(sd_depth_scale)))
         self._base_sd = 1.0
         inner_dim = expansion * dim
-        num_heads = inner_dim // qkv_block_size
+        head_dim = qkv_block_size
+        assert inner_dim % head_dim == 0, "inner_dim must be divisible by qkv_block_size"
+        num_heads = inner_dim // head_dim
         self.inner_dim = inner_dim
+        self.head_dim = head_dim
         self.num_heads = num_heads
-        # Project to 2*inner_dim (matches original proportions)
-        self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
+        self.conv_kind = conv_kind
+        if self.conv_kind != "2d":
+            raise NotImplementedError("ViLLayer currently supports conv_kind='2d' only")
+
+        # Fused ViT-style projection to Q, K, V, and output gate Z.
+        self.qkvz = nn.Linear(dim, 4 * inner_dim, bias=proj_bias)
         assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
-        self.conv_kind = '2d'
         self.conv = nn.Conv2d(
             inner_dim, inner_dim, kernel_size=conv_kernel_size,
             padding=conv_kernel_size // 2, groups=inner_dim,
             bias=conv_bias
         )
-        # Separate projections for Q, K, V (matches original's independent subspaces)
-        self.qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
-        self.v_proj  = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim, num_heads=num_heads, norm_bias=norm_bias,
             eps=1e-6, chunk_size=chunk_size, gate_soft_cap=gate_soft_cap
         )
         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
-        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
+        self.ffn_norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
         self.ffn = FeedForward(
             embedding_dim=dim, ffn_proj_factor=ffn_proj_factor,
             ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
@@ -1209,36 +1212,33 @@ class ViLLayer(nn.Module):
         self.sd_ffn = DropPath(drop_prob=sd_depth_scale)
         self.set_stochastic_depth(1.0)
 
-        # ---- ADD THESE TWO METHODS ----
     def _flatten(self, x: torch.Tensor) -> torch.Tensor:
         """Flattens (B, H, W, D) -> (B, H*W, D)."""
-        return x.view(x.shape[0], -1, x.shape[-1])
+        return x.reshape(x.shape[0], -1, x.shape[-1])
 
     def _unflatten(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """Unflattens (B, H*W, D) -> (B, H, W, D)."""
-        return x.view(x.shape[0], H, W, x.shape[-1])
+        return x.reshape(x.shape[0], H, W, x.shape[-1])
+
+    def _apply_depthwise_conv(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the local 2D mixer on an NHWC tensor and return NHWC."""
+        return self.conv(x.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
 
     def _attn_residual(self, x_in: torch.Tensor) -> torch.Tensor:
         B, H, W, D = x_in.shape
         x = self.norm(x_in)
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1, 2])
-        x_inner = self.proj_up(x)
-        x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)
-        if self.conv_kind == "2d":
-            x_qk_perm = x_qk.permute(0, 3, 1, 2)
-            x_qk_conv = self.conv(x_qk_perm).permute(0, 2, 3, 1)
-        else:  # causal1d
-            x_qk_flat = self._flatten(x_qk)
-            x_qk_conv = self._unflatten(self.conv(x_qk_flat), H, W)
-        x_qk_conv_act = torch.nn.functional.silu(x_qk_conv)
-        qk = self.qk_proj(x_qk_conv_act)
-        q, k = torch.chunk(qk, 2, dim=-1)
-        v = self.v_proj(x_v)
+
+        q, k, v, z = torch.chunk(self.qkvz(x), 4, dim=-1)
+        q = torch.nn.functional.silu(self._apply_depthwise_conv(q))
+        k = torch.nn.functional.silu(self._apply_depthwise_conv(k))
+
         h_tilde_state = self.mlstm_cell(q=self._flatten(q), k=self._flatten(k), v=self._flatten(v))
         h_tilde_state = self._unflatten(h_tilde_state, H, W)
-        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)
-        out = self.proj_down(h_tilde_state_skip)
+        skip = 0.5 * (q + k)
+        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * skip)
+        out = self.proj_down(h_tilde_state_skip * torch.nn.functional.silu(z))
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             out = out.flip(dims=[1, 2])
         return out

@@ -1412,7 +1412,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     }
     repeat_modules = {C3, C3TR, C3Ghost, C3x, RepC3, BottleneckCSP, C2f}
 
-    # New set for transformer-style blocks that take (c1, c2, ...)
+    # Custom ViL/Swin blocks take (c1, c2, ...) and expose c2 as their output channels.
     transformer_modules = {
         ViLBlockPairBlock, ViLFusionBlock, SwinPatchMergeBlock, SwinPatchExpandBlock, VitPosEmbedBlock
     }
@@ -1437,8 +1437,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         
         elif m in transformer_modules:
             c1 = ch[f]
-            c2 = args[1] # Output channels are the second argument
-            args[0] = c1 # Replace placeholder input channels with actual c1
+            c2 = args[1]  # Output channels are the second argument
+            args[0] = c1  # Replace placeholder input channels with actual c1
         
         elif m is VitPatchEmbedBlock:
             # First layer, c1 is from YAML (e.g., 3 for RGB)
@@ -1454,7 +1454,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             # Concatenation sums channels from specified layers
             c2 = sum(ch[x] for x in f)
 
-        elif m is Detect or v10Detect:
+        elif m in {Detect, v10Detect}:
             # Detect head takes a list of input channels
             args.append([ch[x] for x in f])
         

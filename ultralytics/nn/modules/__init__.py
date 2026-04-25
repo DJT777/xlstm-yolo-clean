@@ -79,7 +79,6 @@ from .block import (
     SwinPatchMergeBlock,
     WindowedViLBlockPairBlock,
     WindowedViLFusionBlock,
-    PermuteBlock
 )
 from .conv import (
     CBAM,
@@ -186,4 +185,11 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "VitPatchEmbedBlock",
+    "VitPosEmbedBlock",
+    "ViLBlockPairBlock",
+    "ViLFusionBlock",
+    "PermuteBlock",
+    "SwinPatchExpandBlock",
+    "SwinPatchMergeBlock",
 )
