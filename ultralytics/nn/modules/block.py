@@ -2404,90 +2404,220 @@ class LayerNorm2d(nn.Module):
         x_normed = self.norm(x_permuted)
         return x_normed.permute(0, 3, 1, 2).contiguous()
 
-    
+def round_to_multiple(x: float, multiple: int = 64, min_value: int | None = None) -> int:
+    """
+    Round x to the nearest multiple of `multiple`.
+
+    Example:
+      1024 -> 1024
+      1025 -> 1024
+      1057 -> 1088
+
+    If min_value is provided, the result will be at least min_value.
+    """
+    if multiple <= 0:
+        raise ValueError("multiple must be > 0")
+
+    value = int(round(x / multiple) * multiple)
+
+    if min_value is not None:
+        value = max(value, min_value)
+
+    return value
 
 class ViLFusionBlock(nn.Module):
     """
     Fusion block operating on channels-first input.
+
+    Input:
+        x: (B, C1, H, W)
+
+    Internal:
+        - local/projection path stays BCHW
+        - ViL path is explicitly NHWC
+        - output returns BCHW
+
     Config keys:
-      - ls_kernel_size (int): kernel for LSBlock depthwise conv
-      - rg_kernel_size (int): kernel for RGBlock depthwise conv inside MLP
-      - qkv_block_size, chunk_size, drop_path, etc. passed to ViL stack
+        - ls_kernel_size: kernel for LSBlock depthwise conv
+        - rg_kernel_size: kernel for RGBlock depthwise conv inside MLP
+        - qkv_block_size, chunk_size, drop_path, traversal, etc. passed to ViL stack
+        - mlp_ratio: expansion ratio for RGBlock hidden channels
+        - mlp_multiple: round MLP hidden channels to nearest multiple, default 64
     """
+
     def __init__(self, c1, c2, config=None, n=1, mlp_ratio=4.0):
         super().__init__()
+
         cfg = {} if config is None else dict(config)
+
+        # This block computes H/W dynamically from the input feature map.
+        # Do not let a stale YAML seqlens leak into the ViL internals.
         cfg.pop("seqlens", None)
+
         ls_k = int(cfg.pop("ls_kernel_size", 3))
         rg_k = int(cfg.pop("rg_kernel_size", 3))
+
         mlp_ratio = float(cfg.pop("mlp_ratio", mlp_ratio))
+        mlp_multiple = int(cfg.pop("mlp_multiple", 64))
 
-        hidden_dim = c2
+        hidden_dim = int(c2)
 
-        self.in_proj = (nn.Sequential(
-            nn.Conv2d(c1, hidden_dim, kernel_size=1, bias=False),
-            LayerNorm2d(num_channels=hidden_dim),
-            nn.SiLU()
-        ) if c1 != hidden_dim else nn.Identity())
+        self.in_proj = (
+            nn.Sequential(
+                nn.Conv2d(c1, hidden_dim, kernel_size=1, bias=False),
+                LayerNorm2d(num_channels=hidden_dim),
+                nn.SiLU(),
+            )
+            if c1 != hidden_dim
+            else nn.Identity()
+        )
 
         self.lsblock = LSBlock(hidden_dim, hidden_dim, kernel_size=ls_k)
 
-        # Run n ViL block pairs on NHWC features.
-        self.vil = nn.Sequential(*[
-            ViLBlockPairBlock(hidden_dim, hidden_dim, cfg) for _ in range(int(n))
-        ])
+        # Important:
+        # ViLFusionBlock explicitly permutes to NHWC before calling self.vil,
+        # so the inner ViLBlockPairBlock must not try to infer layout.
+        self.vil = nn.Sequential(
+            *[
+                ViLBlockPairBlock(
+                    hidden_dim,
+                    hidden_dim,
+                    {**cfg, "layout": "nhwc"},
+                )
+                for _ in range(int(n))
+            ]
+        )
 
-        # Conv-MLP with configurable spatial kernel
-        self.mlp = (RGBlock(hidden_dim, int(hidden_dim * mlp_ratio), kernel_size=rg_k)
-                    if mlp_ratio and mlp_ratio > 0 else nn.Identity())
+        if mlp_ratio and mlp_ratio > 0:
+            mlp_hidden_dim = round_to_multiple(
+                hidden_dim * mlp_ratio,
+                multiple=mlp_multiple,
+                min_value=hidden_dim,
+            )
+            self.mlp = RGBlock(hidden_dim, mlp_hidden_dim, kernel_size=rg_k)
+        else:
+            self.mlp = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W)
-        assert x.ndim == 4
-        x_proj = self.in_proj(x)                       # (B, C2, H, W)
-        x_local = self.lsblock(x_proj)                 # (B, C2, H, W)
+        if x.ndim != 4:
+            raise ValueError(
+                f"{self.__class__.__name__} expects BCHW 4D input, got shape {tuple(x.shape)}"
+            )
 
+        # BCHW
+        x_proj = self.in_proj(x)                              # (B, C2, H, W)
+        x_local = self.lsblock(x_proj)                        # (B, C2, H, W)
+
+        # BCHW -> NHWC for ViL
         x_vil_in = x_local.permute(0, 2, 3, 1).contiguous()   # (B, H, W, C2)
         x_vil_out = self.vil(x_vil_in)                        # (B, H, W, C2)
+
+        # NHWC -> BCHW
         x_global = x_vil_out.permute(0, 3, 1, 2).contiguous() # (B, C2, H, W)
 
         x_res = x_proj + x_global
         x_mlp = self.mlp(x_res)
-        return x_res + x_mlp
 
+        return x_res + x_mlp
 
 class ViLBlockPairBlock(nn.Module):
     """
-    NHWC wrapper around ViLBlockPair so it can slot into channels-last pipelines.
-    Accepts and returns (B, H, W, C). Also tolerates BCHW input and returns BCHW in that case.
+    Wrapper around ViLBlockPair.
+
+    Default behavior:
+        layout="auto"
+        - preserves existing behavior for direct YAML/backbone usage
+        - accepts BCHW or NHWC and returns the same layout
+
+    Explicit behavior:
+        layout="nhwc" or layout="bchw"
+        - bypasses ambiguous shape inference
+        - useful when caller already knows the layout
     """
+
     def __init__(self, in_dim: int, out_dim: int, config: Optional[dict] = None):
         super().__init__()
+
         cfg = {} if config is None else dict(config)
+
+        self.layout = str(cfg.pop("layout", "auto")).lower()
+        if self.layout not in {"auto", "nhwc", "bchw"}:
+            raise ValueError(
+                f"{self.__class__.__name__} layout must be 'auto', 'nhwc', or 'bchw', "
+                f"got {self.layout!r}"
+            )
+
+        # Keep current behavior: this wrapper is image-shaped and infers H/W
+        # from the incoming 4D tensor.
         cfg.pop("seqlens", None)
+
         drop_path = float(cfg.pop("drop_path", 0.0))
         conv_kernel_size = int(cfg.pop("conv_kernel_size", 3))
 
-        self.core = ViLBlockPair(dim=out_dim, drop_path=drop_path,
-                                 conv_kernel_size=conv_kernel_size, **cfg)
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
 
-        self.in_dim = in_dim
-        self.out_dim = out_dim
+        self.core = ViLBlockPair(
+            dim=self.out_dim,
+            drop_path=drop_path,
+            conv_kernel_size=conv_kernel_size,
+            **cfg,
+        )
 
-        self.in_adapt = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+        self.in_adapt = (
+            nn.Linear(self.in_dim, self.out_dim, bias=False)
+            if self.in_dim != self.out_dim
+            else nn.Identity()
+        )
         self.out_adapt = nn.Identity()
 
+    def _get_input_layout(self, x: torch.Tensor) -> str:
+        if x.ndim != 4:
+            raise ValueError(
+                f"{self.__class__.__name__} expects a 4D BCHW/NHWC tensor, "
+                f"got shape {tuple(x.shape)}"
+            )
+
+        if self.layout == "auto":
+            return _infer_4d_layout(x, self.in_dim, self.__class__.__name__)
+
+        if self.layout == "nhwc":
+            if x.shape[-1] != self.in_dim:
+                raise ValueError(
+                    f"{self.__class__.__name__} configured as NHWC but expected "
+                    f"{self.in_dim} channels in dim -1, got shape {tuple(x.shape)}"
+                )
+            return "nhwc"
+
+        # self.layout == "bchw"
+        if x.shape[1] != self.in_dim:
+            raise ValueError(
+                f"{self.__class__.__name__} configured as BCHW but expected "
+                f"{self.in_dim} channels in dim 1, got shape {tuple(x.shape)}"
+            )
+        return "bchw"
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_layout = _infer_4d_layout(x, self.in_dim, self.__class__.__name__)
+        input_layout = self._get_input_layout(x)
+
         if input_layout == "bchw":
             b, _, h, w = x.shape
         else:
             b, h, w, _ = x.shape
+
+        # ViLBlockPair expects NHWC-style image features.
         x = _to_nhwc(x, input_layout)
 
-        x = self.in_adapt(x)          # (B,H,W,C_out)
-        x = self.core(x)              # (B,H*W,C_out)
-        x = x.reshape(b, h, w, -1)    # (B,H,W,C_out)
+        x = self.in_adapt(x)          # (B, H, W, C_out)
+        x = self.core(x)              # usually (B, H*W, C_out)
+
+        if x.ndim == 3:
+            x = x.reshape(b, h, w, -1)
+        elif x.ndim != 4:
+            raise ValueError(
+                f"{self.__class__.__name__}.core returned unsupported shape {tuple(x.shape)}"
+            )
+
         x = self.out_adapt(x)
 
         return _from_nhwc(x, input_layout)
