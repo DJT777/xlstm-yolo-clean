@@ -99,14 +99,13 @@ class SequenceConv2d(nn.Conv2d):
         self.seqlens = seqlens
 
     def forward(self, x):
-        # # assert x.ndim == 3
-        # if self.seqlens is None:
-        #     h = math.sqrt(x.size(1))
-        #     assert h.is_integer()
-        #     h = int(h)
-        # else:
-        #     assert len(self.seqlens) == 2
-        #     h = self.seqlens[0]
+        if self.seqlens is None:
+            h = math.sqrt(x.size(1))
+            assert h.is_integer(), f"Sequence length {x.size(1)} is not a perfect square"
+            h = int(h)
+        else:
+            assert len(self.seqlens) == 2
+            h = self.seqlens[0]
         x = einops.rearrange(x, "b (h w) d -> b d h w", h=h)
         x = super().forward(x)
         x = einops.rearrange(x, "b d h w -> b (h w) d")
@@ -224,12 +223,9 @@ class VitPosEmbed(nn.Module):
         self.interpolate_offset = interpolate_offset
         if is_learnable:
             self.embed = nn.Parameter(torch.zeros(1, *seqlens, dim))
-            print(is_learnable)
         else:
             self.register_buffer("embed", get_sincos_pos_embed_from_seqlens(seqlens=seqlens, dim=dim).unsqueeze(0))
         self.reset_parameters()
-
-        print
 
     @property
     def _expected_x_ndim(self):

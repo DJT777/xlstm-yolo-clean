@@ -246,11 +246,10 @@ class ConvGLUFeedForward(nn.Module):
             dim=-1,
         )
         gate = self.act_fn(self._apply_gate_depthwise_conv(gate))
-        x = self.drop(gate * value)
-        x = self.proj_down(x)
+        x = self.proj_down(self.drop(gate * value))
         if self.layer_scale is not None:
             x = x * self.layer_scale
-        return self.drop(x)
+        return x
 
     def reset_parameters(self):
         small_init_(self.proj_up_gate_z.weight, dim=self.embedding_dim)
@@ -413,7 +412,20 @@ class CausalConv1d(nn.Module):
 # ---------------------------------------------------------------------
 # MatrixLSTMCell (production path with fused if-gate + backend)
 # ---------------------------------------------------------------------
+from dataclasses import astuple as _astuple
 from mlstm_kernels.torch.backend_module import mLSTMBackendConfig, mLSTMBackend
+
+# Backends are stateless kernel wrappers (no learned parameters).  Sharing
+# one instance per unique config avoids redundant Triton compilation and
+# reduces per-cell memory overhead.
+_MLSTM_BACKEND_CACHE: dict = {}
+
+
+def _get_mlstm_backend(config: mLSTMBackendConfig) -> mLSTMBackend:
+    key = _astuple(config)
+    if key not in _MLSTM_BACKEND_CACHE:
+        _MLSTM_BACKEND_CACHE[key] = mLSTMBackend(config=config)
+    return _MLSTM_BACKEND_CACHE[key]
 
 class MatrixLSTMCell(nn.Module):
     def __init__(
@@ -457,8 +469,7 @@ class MatrixLSTMCell(nn.Module):
         # Original VisionLSTM pattern: normalize across heads with LayerNorm semantics.
         self.outnorm = MultiHeadLayerNorm(ndim=self.v_dim, weight=True, bias=norm_bias, eps=eps)
 
-        # Backend configs (CPU/GPU, train/infer)
-        self.cpu_backend_config_infer = mLSTMBackendConfig(
+        self.cpu_backend = _get_mlstm_backend(mLSTMBackendConfig(
             chunkwise_kernel="chunkwise--native_autograd",
             sequence_kernel="native_sequence__native",
             step_kernel="native",
@@ -466,11 +477,9 @@ class MatrixLSTMCell(nn.Module):
             autocast_kernel_dtype="bfloat16",
             return_last_states=False,
             mode="train_with_padding",
-            eps=1e-6
-        )
-        self.cpu_backend_infer = mLSTMBackend(config=self.cpu_backend_config_infer)
-
-        self.gpu_backend_config_infer = mLSTMBackendConfig(
+            eps=1e-6,
+        ))
+        self.gpu_backend = _get_mlstm_backend(mLSTMBackendConfig(
             chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
             sequence_kernel="native_sequence__triton",
             step_kernel="triton",
@@ -478,33 +487,8 @@ class MatrixLSTMCell(nn.Module):
             autocast_kernel_dtype="bfloat16",
             return_last_states=False,
             mode="train_with_padding",
-            eps=1e-6
-        )
-        self.gpu_backend_infer = mLSTMBackend(config=self.gpu_backend_config_infer)
-
-        self.cpu_backend_config = mLSTMBackendConfig(
-            chunkwise_kernel="chunkwise--native_autograd",
-            sequence_kernel="native_sequence__native",
-            step_kernel="native",
-            chunk_size=self.chunk_size,
-            autocast_kernel_dtype="bfloat16",
-            return_last_states=False,
-            mode="train_with_padding",
-            eps=1e-6
-        )
-        self.cpu_backend = mLSTMBackend(config=self.cpu_backend_config)
-
-        self.gpu_backend_config = mLSTMBackendConfig(
-            chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
-            sequence_kernel="native_sequence__triton",
-            step_kernel="triton",
-            chunk_size=self.chunk_size,
-            autocast_kernel_dtype="bfloat16",
-            return_last_states=False,
-            mode="train_with_padding",
-            eps=1e-6
-        )
-        self.gpu_backend = mLSTMBackend(config=self.gpu_backend_config)
+            eps=1e-6,
+        ))
 
         self.reset_parameters()
 
@@ -514,8 +498,7 @@ class MatrixLSTMCell(nn.Module):
             raise ValueError("All input tensors (q, k, v) must be on the same device.")
         device = q.device
         Q_dtype = q.dtype
-        backend = (self.gpu_backend if device.type == 'cuda' else self.cpu_backend) if self.training \
-            else (self.gpu_backend_infer if device.type == 'cuda' else self.cpu_backend_infer)
+        backend = self.gpu_backend if device.type == 'cuda' else self.cpu_backend
 
         # gates
         if_gate_input = torch.cat([q, k, v], dim=-1)
@@ -550,19 +533,6 @@ class MatrixLSTMCell(nn.Module):
             f_bias = torch.linspace(3.0, 6.0, steps=self.num_heads, dtype=self.ifgate.bias.dtype, device=self.ifgate.bias.device)
             self.ifgate.bias.data = torch.cat([i_bias, f_bias], dim=0)
 
-
-# # ---- tokenwise RMS norm for Q and K (affine scale) ----
-class QKNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, affine: bool = True):
-        super().__init__()
-        self.eps = eps
-        self.g = nn.Parameter(torch.ones(dim)) if affine else None
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, N, D]
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        if self.g is not None:
-            x = x * self.g
-        return x
 
 
 class ViLLayer(nn.Module):
@@ -788,119 +758,6 @@ class ViLLayer(nn.Module):
 
         return x
 
-# class ViLLayer(nn.Module):
-#     def __init__(self,
-#                  dim,
-#                  direction,
-#                  expansion=2,
-#                  qkv_block_size=16,
-#                  proj_bias=True,
-#                  norm_bias=True,
-#                  conv_bias=True,
-#                  conv_kernel_size=3,
-#                  conv_kind="2d",
-#                  num_blocks=15,
-#                  gate_soft_cap=15.0,
-#                  ffn_proj_factor=2.6667,
-#                  mlp_ratio=2.6667,
-#                  ffn_round_up_to_multiple_of=64,
-#                  weight_mode="fused",
-#                  chunk_size=64,
-#                  sd_depth_scale=0.0,
-#                  **kwargs):
-#         super().__init__()
-#         self.traversal = kwargs.pop('traversal', 'row')
-#         assert self.traversal in ['row', 'column'], "traversal must be 'row' or 'column'"
-#         self.dim = dim
-#         self.direction = direction
-#         self.sd_depth_scale = max(0.0, min(1.0, float(sd_depth_scale)))
-#         self._base_sd = 1.0
-#         inner_dim = expansion * dim
-#         head_dim = qkv_block_size
-#         assert inner_dim % head_dim == 0, "inner_dim must be divisible by qkv_block_size"
-#         num_heads = inner_dim // head_dim
-#         self.inner_dim = inner_dim
-#         self.head_dim = head_dim
-#         self.num_heads = num_heads
-#         self.conv_kind = conv_kind
-#         if self.conv_kind != "2d":
-#             raise NotImplementedError("ViLLayer currently supports conv_kind='2d' only")
-
-#         # Fused ViT-style projection to Q, K, V, and output gate Z.
-#         self.qkvz = nn.Linear(dim, 4 * inner_dim, bias=proj_bias)
-#         assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
-#         self.conv = nn.Conv2d(
-#             inner_dim, inner_dim, kernel_size=conv_kernel_size,
-#             padding=conv_kernel_size // 2, groups=inner_dim,
-#             bias=conv_bias
-#         )
-#         self.mlstm_cell = MatrixLSTMCell(
-#             dim=inner_dim, num_heads=num_heads, norm_bias=norm_bias,
-#             eps=1e-6, chunk_size=chunk_size, gate_soft_cap=gate_soft_cap
-#         )
-#         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
-#         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
-#         self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
-#         self.ffn_norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
-#         self.ffn = FeedForward(
-#             embedding_dim=dim, ffn_proj_factor=ffn_proj_factor,
-#             ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
-#             use_bias=proj_bias, weight_mode=weight_mode, num_blocks=num_blocks or 1,
-#         )
-#         self.sd_attn = DropPath(drop_prob=sd_depth_scale)
-#         self.sd_ffn = DropPath(drop_prob=sd_depth_scale)
-#         self.set_stochastic_depth(1.0)
-
-#     def _flatten(self, x: torch.Tensor) -> torch.Tensor:
-#         """Flattens (B, H, W, D) -> (B, H*W, D)."""
-#         return x.reshape(x.shape[0], -1, x.shape[-1])
-
-#     def _unflatten(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
-#         """Unflattens (B, H*W, D) -> (B, H, W, D)."""
-#         return x.reshape(x.shape[0], H, W, x.shape[-1])
-
-#     def _apply_depthwise_conv(self, x: torch.Tensor) -> torch.Tensor:
-#         """Apply the local 2D mixer on an NHWC tensor and return NHWC."""
-#         return self.conv(x.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
-
-#     def _attn_residual(self, x_in: torch.Tensor) -> torch.Tensor:
-#         B, H, W, D = x_in.shape
-#         x = self.norm(x_in)
-#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
-#             x = x.flip(dims=[1, 2])
-
-#         q, k, v, z = torch.chunk(self.qkvz(x), 4, dim=-1)
-#         q = torch.nn.functional.silu(self._apply_depthwise_conv(q))
-#         k = torch.nn.functional.silu(self._apply_depthwise_conv(k))
-
-#         h_tilde_state = self.mlstm_cell(q=self._flatten(q), k=self._flatten(k), v=self._flatten(v))
-#         h_tilde_state = self._unflatten(h_tilde_state, H, W)
-#         skip = 0.5 * (q + k)
-#         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * skip)
-#         out = self.proj_down(h_tilde_state_skip * torch.nn.functional.silu(z))
-#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
-#             out = out.flip(dims=[1, 2])
-#         return out
-
-
-#     def _ffn_residual(self, x_in: torch.Tensor) -> torch.Tensor:
-#         return self.ffn(self.ffn_norm(x_in))
-
-#     def set_stochastic_depth(self, base_p: float):
-#         base_p = float(max(0.0, min(1.0, base_p)))
-#         self._base_sd = base_p
-#         scaled = base_p * self.sd_depth_scale
-#         self.sd_attn.drop_prob = scaled
-#         self.sd_ffn.drop_prob = scaled
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         if self.traversal == 'column':
-#             x = x.transpose(1, 2).contiguous()
-#         x = self.sd_attn(x, residual_path=self._attn_residual)
-#         x = self.sd_ffn (x, residual_path=self._ffn_residual)
-#         if self.traversal == 'column':
-#             x = x.transpose(1, 2).contiguous()
-#         return x
 
 class ViLBlock(nn.Module):
     def __init__(self, dim, direction, drop_path=0.0, **kwargs):
@@ -1099,245 +956,3 @@ class VisionLSTM2(nn.Module):
             x = self.head(x)
         return x
 
-
-# ---------------------------------------------------------------------
-# Fusion MLPs (kept; some models may import these)
-# ---------------------------------------------------------------------
-class FusionMLPBase(nn.Module):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__()
-        self.dim = dim
-        self.hidden_dim = hidden_dim or 4 * dim
-    def forward(self, x):
-        raise NotImplementedError
-
-
-class MLPBaseline(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        self.net = nn.Sequential(
-            nn.Linear(dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, dim)
-        )
-    def forward(self, x): return self.net(x)
-
-
-class GEGLU(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        self.fc = nn.Linear(dim, self.hidden_dim * 2)
-        self.proj = nn.Linear(self.hidden_dim, dim)
-    def forward(self, x):
-        x1, x2 = self.fc(x).chunk(2, dim=-1)
-        return self.proj(F.gelu(x1) * x2)
-
-
-class SwiGLU(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        self.fc = nn.Linear(dim, self.hidden_dim * 2)
-        self.proj = nn.Linear(self.hidden_dim, dim)
-    def forward(self, x):
-        x1, x2 = self.fc(x).chunk(2, dim=-1)
-        return self.proj(F.silu(x1) * x2)
-
-
-class RGBlock(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        local_dim = self.hidden_dim * 2 // 3
-        self.fc1 = nn.Conv2d(dim, local_dim * 2, kernel_size=1)
-        self.dwconv = nn.Conv2d(local_dim, local_dim, kernel_size=3, padding=1, groups=local_dim)
-        self.fc2 = nn.Conv2d(local_dim, dim, kernel_size=1)
-    def forward(self, x):
-        x, v = self.fc1(x).chunk(2, dim=1)
-        x = F.gelu(self.dwconv(x) + x) * v
-        return self.fc2(x)
-
-
-class ConvMLP(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        self.mlp = nn.Sequential(
-            nn.Conv2d(dim, self.hidden_dim, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1, groups=self.hidden_dim),
-            nn.GELU(),
-            nn.Conv2d(self.hidden_dim, dim, kernel_size=1)
-        )
-    def forward(self, x): return self.mlp(x)
-
-
-class LoRAMLP(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None, rank=16):
-        super().__init__(dim, hidden_dim)
-        self.rank = min(rank, self.hidden_dim)
-        self.down = nn.Linear(dim, self.rank)
-        self.up = nn.Linear(self.rank, dim)
-    def forward(self, x): return self.up(F.relu(self.down(x)))
-
-
-class MLPMixer(FusionMLPBase):
-    def __init__(self, dim, seq_len, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        self.token_mlp = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(seq_len, seq_len),
-        )
-        self.channel_mlp = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, dim)
-        )
-    def forward(self, x):
-        x = x.transpose(1, 2)  # B, C, S
-        x = self.token_mlp(x)
-        x = x.transpose(1, 2)
-        return self.channel_mlp(x)
-
-
-class CrossAttentionMLP(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, self.hidden_dim)
-        self.out = nn.Linear(self.hidden_dim, dim)
-    def forward(self, x1, x2):
-        q = self.q(x1); k = self.k(x2); v = self.v(x2)
-        attn = F.softmax(q @ k.transpose(-2, -1) / (self.dim ** 0.5), dim=-1)
-        return self.out(attn @ v)
-
-
-class FiLMMLP(FusionMLPBase):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__(dim, hidden_dim)
-        self.gamma = nn.Linear(dim, dim)
-        self.beta = nn.Linear(dim, dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, dim)
-        )
-    def forward(self, x, modulator):
-        gamma = self.gamma(modulator)
-        beta = self.beta(modulator)
-        return self.ffn(x) * gamma + beta
-
-
-MLP_REGISTRY = {
-    "baseline": lambda dim, **kwargs: MLPBaseline(dim, **kwargs),
-    "geglu":    lambda dim, **kwargs: GEGLU(dim, **kwargs),
-    "swiglu":   lambda dim, **kwargs: SwiGLU(dim, **kwargs),
-    "rgblock":  lambda dim, **kwargs: RGBlock(dim, **kwargs),
-    "convmlp":  lambda dim, **kwargs: ConvMLP(dim, **kwargs),
-    "lora":     lambda dim, **kwargs: LoRAMLP(dim, **kwargs),
-    "mixer":    lambda dim, seq_len=64, **kw: MLPMixer(dim, seq_len=seq_len, **kw),
-    "crossattn": lambda dim, **kwargs: CrossAttentionMLP(dim, **kwargs),
-    "film":     lambda dim, **kwargs: FiLMMLP(dim, **kwargs),
-}
-
-
-# ---------------------------------------------------------------------
-# Optional FusionViLLayer (not used by your YAML; fixed & safe)
-# ---------------------------------------------------------------------
-class FusionViLLayer(nn.Module):
-    """
-    Optional fusion; not used by your YAML. Kept here for completeness with safe defaults.
-    """
-    def __init__(
-        self,
-        dim,
-        direction="rowwise_from_top_left",
-        mlp_type="baseline",
-        mlp_hidden_dim=None,
-        use_skip=True,
-        use_mlp=True,
-        conv_kind="2d",
-        conv_kernel_size=3,
-        proj_bias=True,
-        norm_bias=True,
-        seqlens=None,
-        num_blocks=1,
-        init_weights="original",
-        seq_len=None,
-        proj_type="linear",  # 'linear', 'conv', or 'sequenceconv'
-    ):
-        super().__init__()
-        self.use_skip = use_skip
-        self.use_mlp = use_mlp
-        self.seq_len = seq_len
-        self.proj_type = proj_type
-        self.dim = dim
-
-        # Project
-        if proj_type == "linear":
-            self.input_proj = nn.Linear(dim * 2, dim)
-        elif proj_type == "conv":
-            self.input_proj = nn.Sequential(
-                nn.Conv2d(dim * 2, dim, kernel_size=1, bias=proj_bias),
-                nn.BatchNorm2d(dim),
-                nn.SiLU()
-            )
-        elif proj_type == "sequenceconv":
-            self.input_proj = SequenceConv2d(
-                in_channels=dim * 2,
-                out_channels=dim,
-                kernel_size=1,
-                padding=0,
-                bias=proj_bias,
-                seqlens=seqlens
-            )
-        else:
-            raise ValueError(f"Unknown proj_type: {proj_type}")
-
-        self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias)
-
-        self.vilayer = ViLLayer(
-            dim=dim,
-            direction=direction,
-            conv_kind=conv_kind,
-            conv_kernel_size=conv_kernel_size,
-            seqlens=seqlens,
-            proj_bias=proj_bias,
-            norm_bias=norm_bias,
-            num_blocks=num_blocks,
-            init_weights=init_weights,
-        )
-
-        self.residual_proj = nn.Identity() if not use_skip else nn.Linear(dim, dim)
-
-        if use_mlp:
-            self.norm2 = LayerNorm(ndim=dim)
-            self.post_mlp = MLP_REGISTRY[mlp_type](
-                dim, hidden_dim=mlp_hidden_dim or dim * 4, seq_len=seq_len
-            )
-        else:
-            self.post_mlp = None
-
-    def forward(self, x1, x2):
-        B, C, H, W = x1.shape
-        # For skip/residual projection from x1, precompute sequence view
-        x1_seq = einops.rearrange(x1, "b c h w -> b (h w) c")
-
-        if self.proj_type == "conv":
-            x = torch.cat([x1, x2], dim=1)             # [B, 2C, H, W]
-            x = self.input_proj(x)                      # [B, C, H, W]
-            x_seq = einops.rearrange(x, "b c h w -> b (h w) c")
-        else:
-            x2_seq = einops.rearrange(x2, "b c h w -> b (h w) c")
-            x_cat  = torch.cat([x1_seq, x2_seq], dim=-1)  # [B, S, 2C]
-            x_seq  = self.input_proj(x_cat)               # [B, S, C]
-
-        fused = self.norm(x_seq)
-        fused_out = self.vilayer(fused)
-
-        if self.use_skip:
-            fused_out = fused_out + self.residual_proj(x1_seq)
-
-        if self.use_mlp:
-            fused_out = fused_out + self.post_mlp(self.norm2(fused_out))
-
-        return einops.rearrange(fused_out, "b (h w) c -> b c h w", h=H, w=W)

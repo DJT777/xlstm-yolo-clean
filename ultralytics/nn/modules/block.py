@@ -1,6 +1,9 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
 
+import math
+
+import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -70,7 +73,6 @@ __all__ = (
     "SwinPatchExpandBlock",
 )
 
-import math
 
 def _normalize_layout(layout: str, owner: str) -> str:
     layout = str(layout).lower()
@@ -1226,8 +1228,6 @@ class TorchVision(nn.Module):
 ################################################################################
 # 1) VisionLSTM - multi-output wrapper
 ################################################################################
-import einops
-
 class VisionLSTMTorch(nn.Module):
     """
     A custom YOLO/Ultralytics block that loads 'VisionLSTM2' from the
@@ -1578,36 +1578,7 @@ class SequenceConv2dBlock(nn.Module):
         #print(f"Layer {self.i}: SequenceConv2dBlock output shape: {x.shape}")
         return x
 
-# class SequenceToImage(nn.Module):
-#     """
-#     Converts flattened sequence [B, H*W, C] back to image [B, C, H, W] using dynamic seqlens.
-#     """
-#     def __init__(self, seqlens):
-#         super().__init__()
-#         self.seqlens = seqlens  # Initial from YAML, overridden per-batch
 
-#     def set_seqlens(self, hw):
-#         self.seqlens = [int(h) for h in hw]
-#         return self
-
-#     def forward(self, x):
-#         B, S, D = x.shape
-#         if len(self.seqlens) == 2:
-#             h, w = self.seqlens
-#             if S != h * w:
-#                 raise ValueError(f"Sequence length {S} does not match seqlens {h}*{w}={h*w}")
-#             return x.view(B, h, w, D).permute(0, 3, 1, 2)  # (B, D, H, W) for 2D
-#         elif len(self.seqlens) == 3:
-#             d, h, w = self.seqlens
-#             if S != d * h * w:
-#                 raise ValueError(f"Sequence length {S} does not match seqlens {d}*{h}*{w}={d*h*w}")
-#             return x.view(B, d, h, w, D).permute(0, 4, 1, 2, 3)  # (B, D, Dep, H, W) for 3D
-#         else:
-#             raise ValueError(f"Unsupported seqlens dimensions: {len(self.seqlens)}")
-    
-
-
-import math
 
 def _infer_square_hw_from_S(S: int):
     """Infer (H,W) assuming square grid: S = H*H."""
@@ -1742,67 +1713,10 @@ class VitPosEmbedBlock(nn.Module):
                 f"{self.__class__.__name__} was configured for {self.layout.upper()} input, "
                 f"but received {input_layout.upper()} shape {tuple(x.shape)}"
             )
-        if self.layout == "bchw":
-            H, W = int(x.shape[2]), int(x.shape[3])
-        else:
-            H, W = int(x.shape[1]), int(x.shape[2])
         x = _to_nhwc(x, self.layout)
-
-        # If VitPosEmbed supports forward(x, seqlens=...), use it; else duck-type set
-        try:
-            x = self.module(x, seqlens=(H, W))
-        except TypeError:
-            _set_seqlens_duck(self.module, (H, W))
-            x = self.module(x)
+        x = self.module(x)
         return _from_nhwc(x, self.layout)
 
-
-
-# class FlattenPosEmbedBlock(nn.Module):
-#     """
-#     A wrapper for VitPosEmbedBlock that re-embeds flattened sequences by reshaping them to their
-#     original grid shape, applying positional embeddings, and flattening them back.
-
-#     Args:
-#         *args: Variable length argument list, typically [c1, c2, seqlens].
-#             - c1 (int): Input dimension (must equal c2).
-#             - c2 (int): Embedding dimension.
-#             - seqlens (list/tuple): Sequence lengths, e.g., [H, W] for 2D or [T, H, W] for 3D.
-#         **kwargs: Additional arguments passed to VitPosEmbedBlock (e.g., is_learnable, allow_interpolation).
-
-#     Input:
-#         x (torch.Tensor): Flattened patch embeddings of shape [B, L, D], where L = H*W (2D) or T*H*W (3D).
-
-#     Output:
-#         torch.Tensor: Flattened embeddings with positional embeddings added, shape [B, L, D].
-#     """
-#     def __init__(self, *args, **kwargs):
-#         super().__init__()
-#         # Parse args similar to VitPosEmbedBlock for YAML compatibility
-#         if len(args) == 1 and isinstance(args[0], (list, tuple)):
-#             args = args[0]
-#         c1, c2, seqlens = args
-#         assert c1 == c2, "Input and output dimensions must be equal"
-#         self.seqlens = seqlens
-#         self.module = VitPosEmbedBlock(*args, **kwargs)
-
-#     def forward(self, x):
-#         # Reshape flattened input [B, L, D] to grid shape based on seqlens
-#         if len(self.seqlens) == 2:  # 2D case: [B, H*W, D] -> [B, H, W, D]
-#             H, W = self.seqlens
-#             x = x.view(-1, H, W, x.shape[-1])
-#         elif len(self.seqlens) == 3:  # 3D case: [B, T*H*W, D] -> [B, T, H, W, D]
-#             T, H, W = self.seqlens
-#             x = x.view(-1, T, H, W, x.shape[-1])
-#         else:
-#             raise ValueError("seqlens must be length 2 or 3")
-        
-#         # Apply positional embeddings using VitPosEmbedBlock
-#         x = self.module(x)
-        
-#         # Flatten back to [B, L, D]
-#         x = x.view(x.shape[0], -1, x.shape[-1])
-#         return x
 
 
 class FlattenPosEmbedBlock(nn.Module):
@@ -1991,30 +1905,6 @@ class VisionClueMerge(nn.Module):
         }
 
 
-
-
-class PatchMerger(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.W = nn.Parameter(torch.randn(out_dim, in_dim))
-
-    def forward(self, x):
-        # x: (B, N, D)
-        scores = torch.einsum('md,bnd->bmn', self.W, x)  # (B, M, N)
-        attention = F.softmax(scores, dim=2)  # (B, M, N)
-        y = torch.einsum('bmn,bnd->bmd', attention, x)  # (B, M, D)
-        return y
-    
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import einops
-
-# Uses the canonical class already present in your file:
-# class PatchMerging(nn.Module):  # 4C -> 2C with RMSNorm
-#   def __init__(self, c1: int, norm_layer=nn.RMSNorm): ...
-#   def forward(self, x: (B,L,C), input_resolution: (H,W)) -> (B, L/4, 2C)
 
 
 class PatchMerging(nn.Module):
