@@ -2363,14 +2363,16 @@ class LSBlock(nn.Module):
 
 class RGBlock(nn.Module):
     """
-    Convolutional MLP (RegLU/GELU-friendly) with optional depthwise spatial kernel.
+    Convolutional MLP with optional gated expansion and depthwise spatial mixing.
     Shape-preserving: (B, C, H, W) -> (B, C, H, W).
     """
     def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3,
-                 drop: float = 0.0, act_layer=nn.GELU):
+                 drop: float = 0.0, act_layer=nn.GELU, rg_gate: bool = False):
         super().__init__()
         pad = kernel_size // 2
-        self.expand = nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=True)
+        self.rg_gate = bool(rg_gate)
+        expand_channels = hidden_channels * 2 if self.rg_gate else hidden_channels
+        self.expand = nn.Conv2d(in_channels, expand_channels, kernel_size=1, bias=True)
         self.dw = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=kernel_size,
                             padding=pad, groups=hidden_channels, bias=True)
         self.act = act_layer()
@@ -2380,6 +2382,9 @@ class RGBlock(nn.Module):
     def forward(self, x):
         identity = x
         x = self.expand(x)
+        if self.rg_gate:
+            x, gate = x.chunk(2, dim=1)
+            x = x * F.silu(gate)
         x = self.dw(x)
         x = self.act(x)
         x = self.project(x)
@@ -2440,6 +2445,8 @@ class ViLFusionBlock(nn.Module):
     Config keys:
         - ls_kernel_size: kernel for LSBlock depthwise conv
         - rg_kernel_size: kernel for RGBlock depthwise conv inside MLP
+        - rg_gate: enable SwiGLU-style gating in RGBlock, default False
+        - rg_drop: dropout inside RGBlock, default 0.0
         - qkv_block_size, chunk_size, drop_path, traversal, etc. passed to ViL stack
         - mlp_ratio: expansion ratio for RGBlock hidden channels
         - mlp_multiple: round MLP hidden channels to nearest multiple, default 64
@@ -2453,9 +2460,14 @@ class ViLFusionBlock(nn.Module):
         # This block computes H/W dynamically from the input feature map.
         # Do not let a stale YAML seqlens leak into the ViL internals.
         cfg.pop("seqlens", None)
+        cfg.setdefault("qk_dim_factor", 0.5)
+        cfg.setdefault("v_dim_factor", 1.0)
+        cfg.setdefault("use_ffn", False)
 
         ls_k = int(cfg.pop("ls_kernel_size", 3))
         rg_k = int(cfg.pop("rg_kernel_size", 3))
+        rg_gate = bool(cfg.pop("rg_gate", False))
+        rg_drop = float(cfg.pop("rg_drop", 0.0))
 
         mlp_ratio = float(cfg.pop("mlp_ratio", mlp_ratio))
         mlp_multiple = int(cfg.pop("mlp_multiple", 64))
@@ -2494,7 +2506,7 @@ class ViLFusionBlock(nn.Module):
                 multiple=mlp_multiple,
                 min_value=hidden_dim,
             )
-            self.mlp = RGBlock(hidden_dim, mlp_hidden_dim, kernel_size=rg_k)
+            self.mlp = RGBlock(hidden_dim, mlp_hidden_dim, kernel_size=rg_k, drop=rg_drop, rg_gate=rg_gate)
         else:
             self.mlp = nn.Identity()
 
@@ -2518,7 +2530,7 @@ class ViLFusionBlock(nn.Module):
         x_res = x_proj + x_global
         x_mlp = self.mlp(x_res)
 
-        return x_res + x_mlp
+        return x_mlp
 
 class ViLBlockPairBlock(nn.Module):
     """

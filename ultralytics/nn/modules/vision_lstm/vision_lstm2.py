@@ -188,6 +188,80 @@ class FeedForward(nn.Module):
             nn.init.zeros_(self.proj_down.bias)
 
 
+class ConvGLUFeedForward(nn.Module):
+    """TransNeXt-style ConvGLU FFN for NHWC vision features."""
+
+    def __init__(
+        self,
+        embedding_dim,
+        ffn_proj_factor=2.6667,
+        ffn_round_up_to_multiple_of=64,
+        use_bias=False,
+        kernel_size=3,
+        drop=0.0,
+        layer_scale_init=0.0,
+        act_layer=nn.GELU,
+        **kwargs,
+    ):
+        super().__init__()
+        if kernel_size % 2 != 1:
+            raise ValueError("ConvGLUFeedForward kernel_size must be odd")
+
+        self.embedding_dim = embedding_dim
+        self.ffn_proj_factor = ffn_proj_factor
+        self.ffn_round_up_to_multiple_of = ffn_round_up_to_multiple_of
+        self.up_proj_dim = round_up_to_next_multiple_of(
+            embedding_dim * ffn_proj_factor, ffn_round_up_to_multiple_of,
+        )
+
+        self.proj_up_gate_z = nn.Linear(embedding_dim, 2 * self.up_proj_dim, bias=use_bias)
+        self.dwconv_gate = nn.Conv2d(
+            self.up_proj_dim,
+            self.up_proj_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=self.up_proj_dim,
+            bias=use_bias,
+        )
+        self.act_fn = act_layer()
+        self.proj_down = nn.Linear(self.up_proj_dim, embedding_dim, bias=use_bias)
+        self.drop = nn.Dropout(drop)
+        self.layer_scale = (
+            nn.Parameter(layer_scale_init * torch.ones(embedding_dim))
+            if layer_scale_init and layer_scale_init > 0
+            else None
+        )
+
+    def _apply_gate_depthwise_conv(self, x: torch.Tensor) -> torch.Tensor:
+        return (
+            self.dwconv_gate(x.permute(0, 3, 1, 2).contiguous())
+            .permute(0, 2, 3, 1)
+            .contiguous()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, value = torch.tensor_split(
+            self.proj_up_gate_z(x),
+            (self.up_proj_dim,),
+            dim=-1,
+        )
+        gate = self.act_fn(self._apply_gate_depthwise_conv(gate))
+        x = self.drop(gate * value)
+        x = self.proj_down(x)
+        if self.layer_scale is not None:
+            x = x * self.layer_scale
+        return self.drop(x)
+
+    def reset_parameters(self):
+        small_init_(self.proj_up_gate_z.weight, dim=self.embedding_dim)
+        if self.proj_up_gate_z.bias is not None:
+            nn.init.zeros_(self.proj_up_gate_z.bias)
+        self.dwconv_gate.reset_parameters()
+        wang_init_(self.proj_down.weight, dim=self.embedding_dim, num_blocks=1)
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
+
+
 # ---------------------------------------------------------------------
 # LayerNorm variants
 # ---------------------------------------------------------------------
@@ -342,21 +416,46 @@ class CausalConv1d(nn.Module):
 from mlstm_kernels.torch.backend_module import mLSTMBackendConfig, mLSTMBackend
 
 class MatrixLSTMCell(nn.Module):
-    def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16,
-                 use_autocast=True, autocast_dtype=torch.bfloat16, gate_soft_cap=15.0):
+    def __init__(
+        self,
+        dim=None,
+        num_heads=1,
+        qk_dim=None,
+        v_dim=None,
+        norm_bias=True,
+        eps=1e-6,
+        chunk_size=16,
+        use_autocast=False,
+        autocast_dtype=torch.bfloat16,
+        gate_soft_cap=15.0,
+    ):
         super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
+        if dim is not None:
+            qk_dim = dim if qk_dim is None else qk_dim
+            v_dim = dim if v_dim is None else v_dim
+        if qk_dim is None or v_dim is None:
+            raise ValueError("MatrixLSTMCell requires dim or explicit qk_dim and v_dim")
+
+        self.qk_dim = int(qk_dim)
+        self.v_dim = int(v_dim)
+        self.dim = self.v_dim
+        self.num_heads = int(num_heads)
+        if self.qk_dim % self.num_heads != 0:
+            raise ValueError(f"qk_dim={self.qk_dim} must be divisible by num_heads={self.num_heads}")
+        if self.v_dim % self.num_heads != 0:
+            raise ValueError(f"v_dim={self.v_dim} must be divisible by num_heads={self.num_heads}")
+        self.qk_head_dim = self.qk_dim // self.num_heads
+        self.v_head_dim = self.v_dim // self.num_heads
         self.use_autocast = use_autocast
         self.autocast_dtype = autocast_dtype
         self.gate_soft_cap = gate_soft_cap
         self.chunk_size = int(chunk_size)
 
         # Fused ifgate projection: produces [i, f] for each head
-        self.ifgate = nn.Linear(3 * dim, 2 * num_heads)
+        self.ifgate = nn.Linear(2 * self.qk_dim + self.v_dim, 2 * self.num_heads)
 
         # Original VisionLSTM pattern: normalize across heads with LayerNorm semantics.
-        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
+        self.outnorm = MultiHeadLayerNorm(ndim=self.v_dim, weight=True, bias=norm_bias, eps=eps)
 
         # Backend configs (CPU/GPU, train/infer)
         self.cpu_backend_config_infer = mLSTMBackendConfig(
@@ -367,7 +466,7 @@ class MatrixLSTMCell(nn.Module):
             autocast_kernel_dtype="bfloat16",
             return_last_states=False,
             mode="train_with_padding",
-            eps=5e-5
+            eps=1e-6
         )
         self.cpu_backend_infer = mLSTMBackend(config=self.cpu_backend_config_infer)
 
@@ -379,7 +478,7 @@ class MatrixLSTMCell(nn.Module):
             autocast_kernel_dtype="bfloat16",
             return_last_states=False,
             mode="train_with_padding",
-            eps=5e-5
+            eps=1e-6
         )
         self.gpu_backend_infer = mLSTMBackend(config=self.gpu_backend_config_infer)
 
@@ -391,7 +490,7 @@ class MatrixLSTMCell(nn.Module):
             autocast_kernel_dtype="bfloat16",
             return_last_states=False,
             mode="train_with_padding",
-            eps=5e-5
+            eps=1e-6
         )
         self.cpu_backend = mLSTMBackend(config=self.cpu_backend_config)
 
@@ -403,14 +502,14 @@ class MatrixLSTMCell(nn.Module):
             autocast_kernel_dtype="bfloat16",
             return_last_states=False,
             mode="train_with_padding",
-            eps=5e-5
+            eps=1e-6
         )
         self.gpu_backend = mLSTMBackend(config=self.gpu_backend_config)
 
         self.reset_parameters()
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        # q,k,v: (B, S, H)
+        # q,k: (B, S, qk_dim), v: (B, S, v_dim)
         if not (q.device == k.device == v.device):
             raise ValueError("All input tensors (q, k, v) must be on the same device.")
         device = q.device
@@ -419,32 +518,27 @@ class MatrixLSTMCell(nn.Module):
             else (self.gpu_backend_infer if device.type == 'cuda' else self.cpu_backend_infer)
 
         # gates
-        if_gate_input = torch.cat([q, k, v], dim=-1)  # (B, S, 3H)
+        if_gate_input = torch.cat([q, k, v], dim=-1)
         if_preact = self.ifgate(if_gate_input)        # (B, S, 2*NH)
         # soft-cap for stability
         if_preact = self.gate_soft_cap * torch.tanh(if_preact / self.gate_soft_cap)
 
         i_preact, f_preact = torch.chunk(if_preact, 2, dim=-1)  # each (B, S, NH)
-        B, S, H = q.shape
+        B, S, _ = q.shape
         # reshape heads
-        q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, DH)
-        k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
-        v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
+        q = q.view(B, S, self.num_heads, self.qk_head_dim).transpose(1, 2)
+        k = k.view(B, S, self.num_heads, self.qk_head_dim).transpose(1, 2)
+        v = v.view(B, S, self.num_heads, self.v_head_dim).transpose(1, 2)
 
         i = i_preact.transpose(-1, -2)  # (B, NH, S)
         f = f_preact.transpose(-1, -2)  # (B, NH, S)
 
-        # autocast routing (match backend dtype)
-        if device.type == 'cuda' and self.use_autocast:
-            q = q.to(self.autocast_dtype); k = k.to(self.autocast_dtype)
-            v = v.to(self.autocast_dtype); i = i.to(self.autocast_dtype); f = f.to(self.autocast_dtype)
-
         h_state = backend(q=q, k=k, v=v, i=i, f=f)
-        h_state = h_state.to(Q_dtype).contiguous()  # (B, NH, S, DH)
+        h_state = h_state.to(Q_dtype).contiguous()  # (B, NH, S, v_head_dim)
 
         # post-norm and merge heads
-        h_state_norm = self.outnorm(h_state)               # (B, NH, S, DH)
-        h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, -1)  # (B, S, H)
+        h_state_norm = self.outnorm(h_state)
+        h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, self.v_dim)
         return h_state_norm
 
     def reset_parameters(self):
@@ -473,14 +567,10 @@ class QKNorm(nn.Module):
 
 class ViLLayer(nn.Module):
     """
-    Conservative post-MLP VisionLSTM layer.
+    VisionLSTM layer with narrow Q/K, full-width V/Z, and optional post-MLP.
 
-    Keeps q/k depthwise convs for local vision bias, but removes the
-    pre-expanded recurrent branch.
-
-    Head accounting:
-      - qkv_block_size is the per-head dimension
-      - num_heads = dim // qkv_block_size
+    Head accounting keeps qkv_block_size as the model-width head sizing hint.
+    Q/K and V may have different per-head dimensions, but share num_heads.
     """
 
     def __init__(
@@ -496,10 +586,17 @@ class ViLLayer(nn.Module):
         conv_kind="2d",
         num_blocks=15,
         gate_soft_cap=15.0,
+        qk_dim_factor=0.5,
+        v_dim_factor=1.0,
         ffn_proj_factor=2.6667,
         mlp_ratio=None,
+        use_ffn=True,
         ffn_round_up_to_multiple_of=64,
         weight_mode="fused",
+        ffn_type="glu",
+        ffn_conv_kernel_size=3,
+        ffn_drop=0.0,
+        ffn_layer_scale_init=0.0,
         chunk_size=64,
         sd_depth_scale=0.0,
         **kwargs,
@@ -514,43 +611,48 @@ class ViLLayer(nn.Module):
         self.sd_depth_scale = max(0.0, min(1.0, float(sd_depth_scale)))
         self._base_sd = 1.0
 
-        # Post-MLP design: no pre-expansion before mLSTM.
-        inner_dim = dim
+        qk_dim = max(1, int(round(dim * float(qk_dim_factor))))
+        v_dim = max(1, int(round(dim * float(v_dim_factor))))
 
-        head_dim = qkv_block_size
-        assert head_dim >= 16, "qkv_block_size is the head dimension and must be >= 16"
-        assert inner_dim % head_dim == 0, "dim must be divisible by qkv_block_size"
+        head_dim = int(qkv_block_size)
+        assert head_dim >= 16, "qkv_block_size must be >= 16"
 
-        num_heads = inner_dim // head_dim
+        num_heads = max(1, dim // head_dim)
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by inferred num_heads={num_heads}")
+        if qk_dim % num_heads != 0:
+            raise ValueError(f"qk_dim={qk_dim} must be divisible by inferred num_heads={num_heads}")
+        if v_dim % num_heads != 0:
+            raise ValueError(f"v_dim={v_dim} must be divisible by inferred num_heads={num_heads}")
 
-        self.inner_dim = inner_dim
+        self.inner_dim = v_dim
+        self.qk_dim = qk_dim
+        self.v_dim = v_dim
         self.head_dim = head_dim
         self.num_heads = num_heads
         self.expansion = 1
+        self.use_ffn = bool(use_ffn)
 
         self.conv_kind = conv_kind
         if self.conv_kind != "2d":
             raise NotImplementedError("ViLLayer currently supports conv_kind='2d' only")
 
-        # Narrow QKV projection.
-        # Old: Linear(dim -> 4 * expansion * dim) for q/k/v/z
-        # New: Linear(dim -> 3 * dim) for q/k/v only
-        self.qkv = nn.Linear(dim, 3 * dim, bias=proj_bias)
+        self.qkvz = nn.Linear(dim, 2 * qk_dim + 2 * v_dim, bias=proj_bias)
 
         assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
 
-        # Keep depthwise q/k convs, but at dim instead of expansion * dim.
         self.conv = nn.Conv2d(
-            dim,
-            dim,
+            qk_dim,
+            qk_dim,
             kernel_size=conv_kernel_size,
             padding=conv_kernel_size // 2,
-            groups=dim,
+            groups=qk_dim,
             bias=conv_bias,
         )
 
         self.mlstm_cell = MatrixLSTMCell(
-            dim=dim,
+            qk_dim=qk_dim,
+            v_dim=v_dim,
             num_heads=num_heads,
             norm_bias=norm_bias,
             eps=1e-6,
@@ -558,20 +660,41 @@ class ViLLayer(nn.Module):
             gate_soft_cap=gate_soft_cap,
         )
 
+        self.learnable_skip = nn.Parameter(torch.ones(v_dim))
+        self.qk_skip_proj = nn.Linear(qk_dim, v_dim, bias=False) if qk_dim != v_dim else nn.Identity()
+        self.proj_down = nn.Linear(v_dim, dim, bias=proj_bias)
+
         self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
-        self.ffn_norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
+        self.ffn_norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6) if self.use_ffn else nn.Identity()
 
         if mlp_ratio is not None:
             ffn_proj_factor = mlp_ratio
 
         # Post-MLP / channel-mixing branch.
-        self.ffn = FeedForward(
-            embedding_dim=dim,
-            ffn_proj_factor=ffn_proj_factor,
-            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
-            use_bias=proj_bias,
-            weight_mode=weight_mode,
-            num_blocks=num_blocks or 1,
+        ffn_type = str(ffn_type).lower()
+        if ffn_type in {"glu", "swiglu", "feedforward"}:
+            ffn_cls = FeedForward
+            ffn_kwargs = {"weight_mode": weight_mode, "num_blocks": num_blocks or 1}
+        elif ffn_type in {"convglu", "gated_conv_ffn", "gated_conv"}:
+            ffn_cls = ConvGLUFeedForward
+            ffn_kwargs = {
+                "kernel_size": ffn_conv_kernel_size,
+                "drop": ffn_drop,
+                "layer_scale_init": ffn_layer_scale_init,
+            }
+        else:
+            raise ValueError(f"Unknown ffn_type: {ffn_type}")
+
+        self.ffn = (
+            ffn_cls(
+                embedding_dim=dim,
+                ffn_proj_factor=ffn_proj_factor,
+                ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+                use_bias=proj_bias,
+                **ffn_kwargs,
+            )
+            if self.use_ffn
+            else nn.Identity()
         )
 
         self.sd_attn = DropPath(drop_prob=sd_depth_scale)
@@ -598,13 +721,11 @@ class ViLLayer(nn.Module):
         """
         mLSTM residual path.
 
-        Conservative post-MLP variant:
-          - q/k/v at model width
+        Modern VisionLSTM-style variant:
+          - q/k use qk_dim_factor * dim
+          - v/z use v_dim_factor * dim
           - q/k get local depthwise conv
-          - mLSTM runs at dim
-          - no z gate
-          - no learnable skip
-          - no proj_down
+          - output is z-gated and projected back to dim
         """
         B, H, W, D = x_in.shape
         assert D == self.dim, f"Expected channel dim {self.dim}, got {D}"
@@ -614,10 +735,15 @@ class ViLLayer(nn.Module):
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1, 2])
 
-        q, k, v = torch.chunk(self.qkv(x), chunks=3, dim=-1)
+        q, k, v, z = torch.split(
+            self.qkvz(x),
+            [self.qk_dim, self.qk_dim, self.v_dim, self.v_dim],
+            dim=-1,
+        )
 
         q = torch.nn.functional.silu(self._apply_depthwise_conv(q))
         k = torch.nn.functional.silu(self._apply_depthwise_conv(k))
+        local_qk_skip = self.qk_skip_proj(0.5 * (q + k))
 
         out = self.mlstm_cell(
             q=self._flatten(q),
@@ -626,6 +752,8 @@ class ViLLayer(nn.Module):
         )
 
         out = self._unflatten(out, H, W)
+        out = out + (self.learnable_skip * local_qk_skip)
+        out = self.proj_down(out * torch.nn.functional.silu(z))
 
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             out = out.flip(dims=[1, 2])
@@ -652,7 +780,8 @@ class ViLLayer(nn.Module):
             x = x.transpose(1, 2).contiguous()
 
         x = self.sd_attn(x, residual_path=self._attn_residual)
-        x = self.sd_ffn(x, residual_path=self._ffn_residual)
+        if self.use_ffn:
+            x = self.sd_ffn(x, residual_path=self._ffn_residual)
 
         if self.traversal == "column":
             x = x.transpose(1, 2).contiguous()

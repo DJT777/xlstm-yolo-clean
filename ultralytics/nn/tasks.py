@@ -13,6 +13,8 @@ import torch
 from torch import nn
 from ultralytics.nn.modules.block import propagate_seqlens
 
+Upsample = nn.Upsample
+
 from ultralytics.nn.modules import (
     AIFI,
     C1,
