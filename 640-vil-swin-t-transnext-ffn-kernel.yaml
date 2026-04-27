@@ -1,0 +1,73 @@
+# Ultralytics YOLO, AGPL-3.0 license
+# Explicit ViL/Swin T configuration with BCHW public layout.
+# ViL/Swin wrappers handle their internal NHWC conversions.
+# Chunking policy:
+#   160x160: S=25600, chunk=256
+#   80x80:   S=6400,  chunk=256
+#   40x40:   S=1600 -> pad to 1664, chunk=128
+#   20x20:   S=400  -> pad to 512,  chunk=128
+
+nc: 80
+
+backbone:
+  - [-1, 1, VitPatchEmbedBlock, [3, 64, [640, 640], [4, 4], null, "xavier_uniform", "bchw"]]  # 0 (B, 64, 160, 160)
+  - [-1, 1, VitPosEmbedBlock, [64, 64, [160, 160], true, true, "bchw"]]  # 1
+
+  # 160x160 => S=25,600, chunk_size=256
+  - [-1, 1, ViLBlockPairBlock, [64, 64, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 256, drop_path: 0.0}]]  # 2
+  - [-1, 1, ViLBlockPairBlock, [64, 64, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 256, drop_path: 0.009}]]  # 3
+
+  - [-1, 1, SwinPatchMergeBlock, [64, 128]]  # 4 (160 -> 80)
+
+  # 80x80 => S=6,400, chunk_size=256
+  - [-1, 1, ViLBlockPairBlock, [128, 128, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 256, drop_path: 0.018}]]  # 5
+  - [-1, 1, ViLBlockPairBlock, [128, 128, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 256, drop_path: 0.027}]]  # 6
+
+  - [-1, 1, SwinPatchMergeBlock, [128, 256]]  # 7 (80 -> 40)
+
+  # 40x40 => S=1,600, pad to 1,664, chunk_size=128
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.036}]]  # 8
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.045}]]  # 9
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.055}]]  # 10
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.064}]]  # 11
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.073}]]  # 12
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.082}]]  # 13
+
+  - [-1, 1, SwinPatchMergeBlock, [256, 512]]  # 14 (40 -> 20)
+
+  # 20x20 => S=400, pad to 512, chunk_size=128
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.091}]]  # 15
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, drop_path: 0.10}]]  # 16
+
+head:
+  - [-1, 1, SPPF, [512, 5]]  # 17 (B, 512, 20, 20)
+
+  - [-1, 1, Conv, [256, 1, 1]]  # 18 (B, 256, 20, 20)
+  - [-1, 1, Upsample, [None, 2, "nearest"]]  # 19 (B, 256, 40, 40)
+
+  - [[-1, 13], 1, Concat, [1]]  # 20 (B, 512, 40, 40)
+
+  # 40x40 => S=1,600, pad to 1,664, chunk_size=128
+  - [-1, 1, ViLFusionBlock, [512, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 0.0, chunk_size: 128}]]  # 21
+
+  - [-1, 1, Conv, [128, 1, 1]]  # 22 (B, 128, 40, 40)
+  - [-1, 1, Upsample, [None, 2, "nearest"]]  # 23 (B, 128, 80, 80)
+
+  - [[-1, 6], 1, Concat, [1]]  # 24 (B, 256, 80, 80)
+
+  # 80x80 => S=6,400, chunk_size=256
+  - [-1, 1, ViLFusionBlock, [256, 128, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 0.0, chunk_size: 256}]]  # 25
+
+  - [-1, 1, Conv, [128, 3, 2]]  # 26 (B, 128, 40, 40)
+  - [[-1, 21], 1, Concat, [1]]  # 27 (B, 384, 40, 40)
+
+  # 40x40 => S=1,600, pad to 1,664, chunk_size=128
+  - [-1, 1, ViLFusionBlock, [384, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 0.0, chunk_size: 128}]]  # 28
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 29 (B, 256, 20, 20)
+  - [[-1, 17], 1, Concat, [1]]  # 30 (B, 768, 20, 20)
+
+  # 20x20 => S=400, pad to 512, chunk_size=128
+  - [-1, 1, ViLFusionBlock, [768, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: true, ffn_type: 'convglu', ffn_conv_kernel_size: 5, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 0.0, chunk_size: 128}]]  # 31
+
+  - [[25, 28, 31], 1, Detect, [nc]]  # 32
