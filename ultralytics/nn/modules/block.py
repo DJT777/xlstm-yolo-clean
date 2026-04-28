@@ -2250,36 +2250,92 @@ class LSBlock(nn.Module):
         x = identity + self.drop(x)
         return x
 
-
 class RGBlock(nn.Module):
     """
-    Convolutional MLP with optional gated expansion and depthwise spatial mixing.
+    Residual gated convolutional FFN for feature fusion.
     Shape-preserving: (B, C, H, W) -> (B, C, H, W).
+
+    Same interface as your version.
+
+    rg_gate=False:
+        1x1 expand -> depthwise + identity -> act -> 1x1 project -> residual
+
+    rg_gate=True:
+        1x1 expand -> split gate/value
+        gate = act(depthwise(gate) + gate)
+        out = gate * value
+        -> 1x1 project -> residual
     """
-    def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3,
-                 drop: float = 0.0, act_layer=nn.GELU, rg_gate: bool = False):
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        kernel_size: int = 3,
+        drop: float = 0.0,
+        act_layer=nn.GELU,
+        rg_gate: bool = False,
+    ):
         super().__init__()
+
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size should be odd for shape preservation.")
+
         pad = kernel_size // 2
         self.rg_gate = bool(rg_gate)
+
         expand_channels = hidden_channels * 2 if self.rg_gate else hidden_channels
-        self.expand = nn.Conv2d(in_channels, expand_channels, kernel_size=1, bias=True)
-        self.dw = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=kernel_size,
-                            padding=pad, groups=hidden_channels, bias=True)
+
+        self.expand = nn.Conv2d(
+            in_channels,
+            expand_channels,
+            kernel_size=1,
+            bias=True,
+        )
+
+        self.dw = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=kernel_size,
+            padding=pad,
+            groups=hidden_channels,
+            bias=True,
+        )
+
         self.act = act_layer()
-        self.project = nn.Conv2d(hidden_channels, in_channels, kernel_size=1, bias=True)
+
+        self.project = nn.Conv2d(
+            hidden_channels,
+            in_channels,
+            kernel_size=1,
+            bias=True,
+        )
+
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
         identity = x
+
         x = self.expand(x)
+
         if self.rg_gate:
-            x, gate = x.chunk(2, dim=1)
-            x = x * F.silu(gate)
-        x = self.dw(x)
-        x = self.act(x)
+            gate, value = x.chunk(2, dim=1)
+
+            # Prior RGBlock-style operation:
+            # local depthwise refinement + identity-preserving gate path
+            gate = self.act(self.dw(gate) + gate)
+
+            x = gate * value
+            x = self.drop(x)
+        else:
+            # Non-gated local conv-MLP path, still using the same
+            # depthwise + identity refinement idea.
+            x = self.act(self.dw(x) + x)
+
         x = self.project(x)
-        x = identity + self.drop(x)
-        return x
+        x = self.drop(x)
+
+        return identity + x
 
 
 class LayerNorm2d(nn.Module):

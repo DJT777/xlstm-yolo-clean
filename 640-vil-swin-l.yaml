@@ -1,0 +1,52 @@
+# Ultralytics YOLO, AGPL-3.0 license
+# Explicit ViL/Swin L configuration with BCHW public layout.
+# ViL/Swin wrappers handle their internal NHWC conversions.
+
+nc: 80
+
+backbone:
+  - [-1, 1, VitPatchEmbedBlock, [3, 128, [640, 640], [4, 4], null, "xavier_uniform", "bchw"]]  # 0 (B, 128, 160, 160)
+  - [-1, 1, VitPosEmbedBlock, [128, 128, [160, 160], true, true, "bchw"]]  # 1
+  - [-1, 1, ViLBlockPairBlock, [128, 128, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.0}]]  # 2
+  - [-1, 1, ViLBlockPairBlock, [128, 128, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.017}]]  # 3
+  - [-1, 1, SwinPatchMergeBlock, [128, 256]]  # 4 (160 -> 80)
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.035}]]  # 5
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.052}]]  # 6
+  - [-1, 1, SwinPatchMergeBlock, [256, 512]]  # 7 (80 -> 40)
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.070}]]  # 8
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.087}]]  # 9
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.104}]]  # 10
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.122}]]  # 11
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.139}]]  # 12
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.157}]]  # 13
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.174}]]  # 14
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.191}]]  # 15
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.209}]]  # 16
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.226}]]  # 17
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.243}]]  # 18
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.261}]]  # 19
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.278}]]  # 20
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.296}]]  # 21
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.313}]]  # 22
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.330}]]  # 23
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.348}]]  # 24
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.365}]]  # 25
+  - [-1, 1, SwinPatchMergeBlock, [512, 1024]]  # 26 (40 -> 20)
+  - [-1, 1, ViLBlockPairBlock, [1024, 1024, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.383}]]  # 27
+  - [-1, 1, ViLBlockPairBlock, [1024, 1024, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, drop_path: 0.400}]]  # 28
+
+head:
+  - [-1, 1, SPPF, [1024, 5]]  # 29 (B, 1024, 20, 20)
+  - [-1, 1, SwinPatchExpandBlock, [1024, 512]]  # 30 (B, 512, 40, 40)
+  - [[-1, 25], 1, Concat, [1]]  # 31 (B, 1024, 40, 40)
+  - [-1, 1, ViLFusionBlock, [1024, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, mlp_ratio: 4.0}]]  # 32 (B, 512, 40, 40)
+  - [-1, 1, SwinPatchExpandBlock, [512, 256]]  # 33 (B, 256, 80, 80)
+  - [[-1, 6], 1, Concat, [1]]  # 34 (B, 512, 80, 80)
+  - [-1, 1, ViLFusionBlock, [512, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, mlp_ratio: 4.0}]]  # 35 (B, 256, 80, 80)
+  - [-1, 1, Conv, [256, 3, 2]]  # 36 (B, 256, 40, 40)
+  - [[-1, 32], 1, Concat, [1]]  # 37 (B, 768, 40, 40)
+  - [-1, 1, ViLFusionBlock, [768, 512, {qkv_block_size: 64, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, mlp_ratio: 4.0}]]  # 38 (B, 512, 40, 40)
+  - [-1, 1, Conv, [512, 3, 2]]  # 39 (B, 512, 20, 20)
+  - [[-1, 29], 1, Concat, [1]]  # 40 (B, 1536, 20, 20)
+  - [-1, 1, ViLFusionBlock, [1536, 1024, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, mlp_ratio: 4.0}]]  # 41 (B, 1024, 20, 20)
+  - [[35, 38, 41], 1, v10Detect, [nc]]  # 42

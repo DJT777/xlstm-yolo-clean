@@ -37,6 +37,13 @@ fraction: 1.0 # (float) dataset fraction to train on (default is 1.0, all images
 profile: False # (bool) profile ONNX and TensorRT speeds during training for loggers
 freeze: None # (int | list, optional) freeze first n layers, or freeze list of layer indices during training
 multi_scale: False # (bool) Whether to use multiscale during training
+multi_scale_min: 0.9 # (float) minimum multi-scale factor for ViL/Swin-safe sampling
+multi_scale_max: 1.1 # (float) maximum multi-scale factor for ViL/Swin-safe sampling
+multi_scale_min_size: # (int, optional) explicit minimum sampled train image size
+multi_scale_max_size: # (int, optional) explicit maximum sampled train image size
+vil_grid_stride: 32 # (int) image-size lattice for ViL/Swin feature grids
+vil_patch_stride: 4 # (int) ViL P2 patch stride used for Triton token-limit clamping
+vil_triton_token_limit: 0 # (int) max batch*P2_sequence tokens for xl_chunk_siging; 0 disables clamp
 # Segmentation
 overlap_mask: True # (bool) merge object masks into a single image mask during training (segment train only)
 mask_ratio: 4 # (int) mask downsample ratio (segment train only)

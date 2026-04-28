@@ -1,0 +1,68 @@
+# Ultralytics YOLO, AGPL-3.0 license
+# multi-scale78-style ViL/Swin topology with T TransNeXt/FFN kernel block configs.
+# Public layout is BCHW; ViL/Swin wrappers handle their internal NHWC conversions.
+#
+# Design pattern copied from the saved multi-scale78 checkpoint:
+#   - compact backbone depth: 1 / 1 / 3 / 1
+#   - Swin patch merge down path
+#   - Swin patch expand top-down head
+#   - ViL fusion PAFPN
+#
+# Layer/channel configs mirror 640-vil-swin-t-transnext-ffn-kernel.yaml:
+#   - Channel ladder: 64 -> 128 -> 256 -> 512
+#   - qkv_block_size: 32 / 32 / 32 / 64
+#   - qk_dim_factor=0.5, v_dim_factor=1.0
+#   - SwiGLU FFN in backbone ViL blocks
+#   - chunk sizes: 512 / 256 / 128 / 128
+#
+# drop_path is held at 0.0 to match the high-performing multi-scale78 recipe.
+
+nc: 80
+
+backbone:
+  - [-1, 1, VitPatchEmbedBlock, [3, 64, [640, 640], [4, 4], null, "xavier_uniform", "bchw"]]  # 0 (B, 64, 160, 160)
+  - [-1, 1, VitPosEmbedBlock, [64, 64, [160, 160], true, true, "bchw"]]  # 1
+
+  # 160x160 => S=25,600, chunk_size=512
+  - [-1, 1, ViLBlockPairBlock, [64, 64, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 512, ckpt_thresh: 6400, drop_path: 0.0}]]  # 2
+
+  - [-1, 1, SwinPatchMergeBlock, [64, 128]]  # 3 (160 -> 80)
+
+  # 80x80 => S=6,400, chunk_size=256
+  - [-1, 1, ViLBlockPairBlock, [128, 128, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 256, ckpt_thresh: 25600, drop_path: 0.0}]]  # 4
+
+  - [-1, 1, SwinPatchMergeBlock, [128, 256]]  # 5 (80 -> 40)
+
+  # 40x40 => S=1,600, pad to 1,664, chunk_size=128
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, ckpt_thresh: 25600, drop_path: 0.0}]]  # 6
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, ckpt_thresh: 25600, drop_path: 0.0}]]  # 7
+  - [-1, 1, ViLBlockPairBlock, [256, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, ckpt_thresh: 25600, drop_path: 0.0}]]  # 8
+
+  - [-1, 1, SwinPatchMergeBlock, [256, 512]]  # 9 (40 -> 20)
+
+  # 20x20 => S=400, pad to 512, chunk_size=128
+  - [-1, 1, ViLBlockPairBlock, [512, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, ffn_proj_factor: 2.6667, use_ffn: true, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, chunk_size: 128, ckpt_thresh: 25600, drop_path: 0.0}]]  # 10
+
+head:
+  - [-1, 1, SPPF, [512, 5]]  # 11 (B, 512, 20, 20)
+
+  # P5 -> P4, preserving the multi-scale78 Swin-expand head pattern.
+  - [-1, 1, SwinPatchExpandBlock, [512, 512]]  # 12 (B, 512, 40, 40)
+  - [[-1, 8], 1, Concat, [1]]  # 13 (B, 768, 40, 40)
+  - [-1, 1, ViLFusionBlock, [768, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 4.0, chunk_size: 128, ckpt_thresh: 25600}]]  # 14
+
+  # P4 -> P3.
+  - [-1, 1, SwinPatchExpandBlock, [256, 256]]  # 15 (B, 256, 80, 80)
+  - [[-1, 4], 1, Concat, [1]]  # 16 (B, 384, 80, 80)
+  - [-1, 1, ViLFusionBlock, [384, 256, {qkv_block_size: 32, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 4.0, chunk_size: 256, ckpt_thresh: 25600}]]  # 17
+
+  # Bottom-up PAFPN.
+  - [-1, 1, Conv, [256, 3, 2]]  # 18 (B, 256, 40, 40)
+  - [[-1, 14], 1, Concat, [1]]  # 19 (B, 512, 40, 40)
+  - [-1, 1, ViLFusionBlock, [512, 256, {qkv_block_size: 32, traversal: 'column', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 4.0, chunk_size: 128, ckpt_thresh: 25600}]]  # 20
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 21 (B, 256, 20, 20)
+  - [[-1, 11], 1, Concat, [1]]  # 22 (B, 768, 20, 20)
+  - [-1, 1, ViLFusionBlock, [768, 512, {qkv_block_size: 64, traversal: 'row', qk_dim_factor: 0.5, v_dim_factor: 1.0, use_ffn: false, ffn_type: 'swiglu', ffn_conv_kernel_size: 3, ffn_drop: 0.0, ffn_layer_scale_init: 1.0e-4, mlp_ratio: 4.0, chunk_size: 128, ckpt_thresh: 25600}]]  # 23
+
+  - [[17, 20, 23], 1, Detect, [nc]]  # 24

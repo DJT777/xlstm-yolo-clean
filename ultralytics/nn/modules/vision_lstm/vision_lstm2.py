@@ -775,7 +775,7 @@ class ViLBlock(nn.Module):
 
 
 class ViLBlockPair(nn.Module):
-    def __init__(self, dim: int, drop_path: float = 0.0, ckpt_thresh: int = 100 * 100, **kwargs):
+    def __init__(self, dim: int, drop_path: float = 0.0, ckpt_thresh: int = 200 * 200, **kwargs):
         super().__init__()
         self.ckpt_thresh = int(ckpt_thresh)
         # Pop seqlens, as it's no longer used for initialization

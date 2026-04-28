@@ -71,19 +71,54 @@ class DetectionTrainer(BaseTrainer):
     #         batch["img"] = imgs
     #     return batch
 
+    def _multiscale_size(self, shape, batch_size=1):
+        """Sample a ViL/Swin-safe image size in the configured multi-scale range."""
+        base = self.args.imgsz[0] if isinstance(self.args.imgsz, (list, tuple)) else int(self.args.imgsz)
+        min_scale = float(getattr(self.args, "multi_scale_min", 0.7))
+        max_scale = float(getattr(self.args, "multi_scale_max", 1.3))
+        if min_scale <= 0 or max_scale < min_scale:
+            raise ValueError(f"Invalid multi-scale range: {min_scale}..{max_scale}")
+
+        # The ViL backbone uses patch_size=4 followed by three 2x Swin merges,
+        # so image sizes must stay on a 32px lattice to preserve integral grids.
+        yolo_stride = max(int(getattr(self, "stride", 32)), 1)
+        vil_stride = int(getattr(self.args, "vil_grid_stride", 32) or 32)
+        size_multiple = math.lcm(yolo_stride, vil_stride)
+
+        min_size = math.ceil(base * min_scale / size_multiple) * size_multiple
+        max_size = math.floor(base * max_scale / size_multiple) * size_multiple
+        min_size_arg = getattr(self.args, "multi_scale_min_size", None)
+        max_size_arg = getattr(self.args, "multi_scale_max_size", None)
+        if min_size_arg:
+            min_size = max(min_size, math.ceil(int(min_size_arg) / size_multiple) * size_multiple)
+        if max_size_arg:
+            max_size = min(max_size, math.floor(int(max_size_arg) / size_multiple) * size_multiple)
+        token_limit = int(getattr(self.args, "vil_triton_token_limit", 2**21) or 0)
+        patch_stride = int(getattr(self.args, "vil_patch_stride", 4) or 4)
+        if token_limit > 0 and batch_size > 0 and patch_stride > 0:
+            # The xl_chunk_siging Triton kernel in mlstm_kernels 2.0.2 fails on
+            # large P2 token slabs before the raw CUDA grid limit is reached.
+            max_tokens_per_image = max(1, token_limit // int(batch_size))
+            token_safe_size = int(math.sqrt(max_tokens_per_image)) * patch_stride
+            token_safe_size = (token_safe_size // size_multiple) * size_multiple
+            if token_safe_size >= size_multiple:
+                max_size = min(max_size, token_safe_size)
+        if max_size < min_size:
+            max_size = min_size
+
+        size = random.randrange(min_size, max_size + size_multiple, size_multiple)
+        if shape[0] == shape[1]:
+            return [size, size]
+
+        scale = size / max(shape)
+        return [max(size_multiple, round(x * scale / size_multiple) * size_multiple) for x in shape]
+
     def preprocess_batch(self, batch):
         batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
         if self.args.multi_scale:
             imgs = batch["img"]
-            # Define scale range: 0.5 for ~320 (lower bound), 1.5 for ~960 (upper bound) on 640 base
-            min_scale = 0.7
-            max_scale = 1.3
-            sf = random.uniform(min_scale, max_scale)  # Uniform random scale factor
-            if sf != 1:
-                # Compute new size, ensuring multiple of stride (32)
-                ns = [math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]]
-                # Clamp to bounds if needed (though uniform should stay within)
-                ns = [max(320, min(960, s)) for s in ns]  # Optional: Enforce exact bounds
+            ns = self._multiscale_size(imgs.shape[2:], batch_size=imgs.shape[0])
+            if list(imgs.shape[2:]) != ns:
                 imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
             batch["img"] = imgs
         return batch
